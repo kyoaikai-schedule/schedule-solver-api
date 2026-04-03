@@ -1,25 +1,81 @@
-"""OR-Tools CP-SAT nurse schedule solver."""
+"""OR-Tools CP-SAT nurse schedule solver — v2 full rewrite."""
 
+from __future__ import annotations
+from datetime import date
 from ortools.sat.python import cp_model
 
-# Shift constants
-NULL = 0
-DAY = 1
-NIGHT = 2
-AKE = 3       # 明け
-KAN_NIGHT = 4 # 管夜
-KAN_AKE = 5   # 管明
-OFF = 6       # 休
+# ──────────────────────────────────────
+# Shift constants (0 is NOT used)
+# ──────────────────────────────────────
+DAY = 1        # 日勤
+NIGHT = 2      # 夜勤
+AKE = 3        # 明け
+KAN_NIGHT = 4  # 管夜
+KAN_AKE = 5    # 管明
+OFF = 6        # 公休
+YU = 7         # 有休
 
-SHIFT_LABELS = {NULL: "", DAY: "日", NIGHT: "夜", AKE: "明", KAN_NIGHT: "管夜", KAN_AKE: "管明", OFF: "休"}
+SHIFT_LABELS = {
+    0: None, 1: "日", 2: "夜", 3: "明",
+    4: "管夜", 5: "管明", 6: "休", 7: "有",
+}
+REQUEST_MAP = {
+    "日": DAY, "夜": NIGHT, "明": AKE,
+    "管夜": KAN_NIGHT, "管明": KAN_AKE, "休": OFF, "有": YU,
+}
+HARD_REQUESTS = {"休", "有"}
+WORK_SHIFTS = {DAY, NIGHT, KAN_NIGHT}  # shifts that count as "working"
 
-REQUEST_MAP = {"日": DAY, "夜": NIGHT, "明": AKE, "管夜": KAN_NIGHT, "管明": KAN_AKE, "休": OFF, "有": OFF}
-HARD_REQUEST = {"休", "有"}
+
+# ──────────────────────────────────────
+# Night staffing requirement (weekly alternating pattern)
+# ──────────────────────────────────────
+def _build_night_req_table(
+    year: int, month: int, num_days: int,
+    night_pattern: list[int], start_with_three: bool = False,
+) -> list[int]:
+    """Return list[num_days] with the required night-shift count per day.
+
+    The pattern alternates *weekly* (Sun-Sat weeks).
+    Week boundaries are determined from the actual calendar.
+    """
+    first_dow = date(year, month + 1, 1).weekday()  # 0=Mon … 6=Sun
+    # Convert to JS-style: 0=Sun, 1=Mon … 6=Sat
+    first_dow_js = (first_dow + 1) % 7
+
+    table: list[int] = []
+    week_idx = 0
+    days_until_sunday = (7 - first_dow_js) % 7
+
+    # First partial week (if month doesn't start on Sunday)
+    if days_until_sunday > 0 and days_until_sunday < 7:
+        pat_idx = 0 if start_with_three else 1
+        cnt = night_pattern[pat_idx % len(night_pattern)]
+        for _ in range(min(days_until_sunday, num_days)):
+            table.append(cnt)
+        week_idx = 1
+
+    # Full weeks
+    while len(table) < num_days:
+        if start_with_three:
+            pat_idx = week_idx % len(night_pattern)
+        else:
+            pat_idx = (week_idx + 1) % len(night_pattern)
+        cnt = night_pattern[pat_idx]
+        for _ in range(7):
+            if len(table) >= num_days:
+                break
+            table.append(cnt)
+        week_idx += 1
+
+    return table
 
 
 def solve_schedule(request_data: dict) -> list[dict]:
     nurses = request_data["nurses"]
-    days_in_month = request_data["daysInMonth"]
+    num_days = request_data["daysInMonth"]
+    year = request_data.get("year", 2026)
+    month = request_data.get("month", 0)  # 0-indexed JS month
     config = request_data["config"]
     requests = request_data.get("requests", {})
     night_ng_pairs = request_data.get("nightNgPairs", [])
@@ -30,375 +86,370 @@ def solve_schedule(request_data: dict) -> list[dict]:
 
     weekday_day_staff = config["weekdayDayStaff"]
     weekend_day_staff = config["weekendDayStaff"]
-    night_pattern = config["nightShiftPattern"]
+    night_pattern = config.get("nightShiftPattern", [2, 2])
     max_night = config.get("maxNightShifts", 6)
     max_days_off = config.get("maxDaysOff", 10)
     max_consec = config.get("maxConsecutiveDays", 3)
     max_double_night = config.get("maxDoubleNightPairs", 2)
 
-    # Filter out excluded nurses
     active_nurses = [n for n in nurses if not n.get("excludeFromGeneration", False)]
     num_nurses = len(active_nurses)
-    num_days = days_in_month
     D = range(num_days)
     N = range(num_nurses)
 
+    night_req_table = _build_night_req_table(
+        year, month, num_days, night_pattern,
+        start_with_three=config.get("startWithThree", False),
+    )
+
     forbidden_solutions: list[dict] = []
-    results = []
+    results: list[dict] = []
     pattern_labels = ["パターンA", "パターンB", "パターンC", "パターンD", "パターンE"]
 
     for pat_idx in range(num_patterns):
         model = cp_model.CpModel()
 
-        # --- Variables ---
-        shifts = {}
-        is_day = {}
-        is_night = {}
-        is_ake = {}
-        is_kan_night = {}
-        is_kan_ake = {}
-        is_off = {}
-        is_working = {}
+        # ── Variables ──────────────────────
+        shifts: dict[tuple[int, int], cp_model.IntVar] = {}
+        is_day: dict[tuple[int, int], cp_model.IntVar] = {}
+        is_night: dict[tuple[int, int], cp_model.IntVar] = {}
+        is_ake: dict[tuple[int, int], cp_model.IntVar] = {}
+        is_kan_night: dict[tuple[int, int], cp_model.IntVar] = {}
+        is_kan_ake: dict[tuple[int, int], cp_model.IntVar] = {}
+        is_off: dict[tuple[int, int], cp_model.IntVar] = {}
+        is_yu: dict[tuple[int, int], cp_model.IntVar] = {}
+        is_working: dict[tuple[int, int], cp_model.IntVar] = {}
 
         for n in N:
             for d in D:
-                shifts[(n, d)] = model.NewIntVar(0, 6, f"shift_n{n}_d{d}")
-                is_day[(n, d)] = model.NewBoolVar(f"is_day_n{n}_d{d}")
-                is_night[(n, d)] = model.NewBoolVar(f"is_night_n{n}_d{d}")
-                is_ake[(n, d)] = model.NewBoolVar(f"is_ake_n{n}_d{d}")
-                is_kan_night[(n, d)] = model.NewBoolVar(f"is_kan_night_n{n}_d{d}")
-                is_kan_ake[(n, d)] = model.NewBoolVar(f"is_kan_ake_n{n}_d{d}")
-                is_off[(n, d)] = model.NewBoolVar(f"is_off_n{n}_d{d}")
-                is_working[(n, d)] = model.NewBoolVar(f"is_working_n{n}_d{d}")
+                # H1: domain 1..7 — no NULL, every cell must have a shift
+                shifts[(n, d)] = model.new_int_var(1, 7, f"s_{n}_{d}")
 
-                # Link bool vars to shift var
-                model.Add(shifts[(n, d)] == DAY).OnlyEnforceIf(is_day[(n, d)])
-                model.Add(shifts[(n, d)] != DAY).OnlyEnforceIf(is_day[(n, d)].Not())
-                model.Add(shifts[(n, d)] == NIGHT).OnlyEnforceIf(is_night[(n, d)])
-                model.Add(shifts[(n, d)] != NIGHT).OnlyEnforceIf(is_night[(n, d)].Not())
-                model.Add(shifts[(n, d)] == AKE).OnlyEnforceIf(is_ake[(n, d)])
-                model.Add(shifts[(n, d)] != AKE).OnlyEnforceIf(is_ake[(n, d)].Not())
-                model.Add(shifts[(n, d)] == KAN_NIGHT).OnlyEnforceIf(is_kan_night[(n, d)])
-                model.Add(shifts[(n, d)] != KAN_NIGHT).OnlyEnforceIf(is_kan_night[(n, d)].Not())
-                model.Add(shifts[(n, d)] == KAN_AKE).OnlyEnforceIf(is_kan_ake[(n, d)])
-                model.Add(shifts[(n, d)] != KAN_AKE).OnlyEnforceIf(is_kan_ake[(n, d)].Not())
-                model.Add(shifts[(n, d)] == OFF).OnlyEnforceIf(is_off[(n, d)])
-                model.Add(shifts[(n, d)] != OFF).OnlyEnforceIf(is_off[(n, d)].Not())
+                is_day[(n, d)] = model.new_bool_var(f"id_{n}_{d}")
+                is_night[(n, d)] = model.new_bool_var(f"in_{n}_{d}")
+                is_ake[(n, d)] = model.new_bool_var(f"ia_{n}_{d}")
+                is_kan_night[(n, d)] = model.new_bool_var(f"ikn_{n}_{d}")
+                is_kan_ake[(n, d)] = model.new_bool_var(f"ika_{n}_{d}")
+                is_off[(n, d)] = model.new_bool_var(f"io_{n}_{d}")
+                is_yu[(n, d)] = model.new_bool_var(f"iy_{n}_{d}")
+                is_working[(n, d)] = model.new_bool_var(f"iw_{n}_{d}")
 
-                # Working = day or night or kan_night
-                model.AddBoolOr([is_day[(n, d)], is_night[(n, d)], is_kan_night[(n, d)]]).OnlyEnforceIf(is_working[(n, d)])
-                model.AddBoolAnd([is_day[(n, d)].Not(), is_night[(n, d)].Not(), is_kan_night[(n, d)].Not()]).OnlyEnforceIf(is_working[(n, d)].Not())
+                # Link bools ↔ shift var
+                model.add(shifts[(n, d)] == DAY).only_enforce_if(is_day[(n, d)])
+                model.add(shifts[(n, d)] != DAY).only_enforce_if(is_day[(n, d)].negated())
+                model.add(shifts[(n, d)] == NIGHT).only_enforce_if(is_night[(n, d)])
+                model.add(shifts[(n, d)] != NIGHT).only_enforce_if(is_night[(n, d)].negated())
+                model.add(shifts[(n, d)] == AKE).only_enforce_if(is_ake[(n, d)])
+                model.add(shifts[(n, d)] != AKE).only_enforce_if(is_ake[(n, d)].negated())
+                model.add(shifts[(n, d)] == KAN_NIGHT).only_enforce_if(is_kan_night[(n, d)])
+                model.add(shifts[(n, d)] != KAN_NIGHT).only_enforce_if(is_kan_night[(n, d)].negated())
+                model.add(shifts[(n, d)] == KAN_AKE).only_enforce_if(is_kan_ake[(n, d)])
+                model.add(shifts[(n, d)] != KAN_AKE).only_enforce_if(is_kan_ake[(n, d)].negated())
+                model.add(shifts[(n, d)] == OFF).only_enforce_if(is_off[(n, d)])
+                model.add(shifts[(n, d)] != OFF).only_enforce_if(is_off[(n, d)].negated())
+                model.add(shifts[(n, d)] == YU).only_enforce_if(is_yu[(n, d)])
+                model.add(shifts[(n, d)] != YU).only_enforce_if(is_yu[(n, d)].negated())
 
-        # --- Hard Constraints ---
+                # is_working = DAY or NIGHT or KAN_NIGHT
+                model.add_bool_or([is_day[(n, d)], is_night[(n, d)], is_kan_night[(n, d)]]).only_enforce_if(is_working[(n, d)])
+                model.add_bool_and([is_day[(n, d)].negated(), is_night[(n, d)].negated(), is_kan_night[(n, d)].negated()]).only_enforce_if(is_working[(n, d)].negated())
+
+        # ── Hard Constraints ──────────────
 
         for n in N:
             nurse = active_nurses[n]
             nurse_id = str(nurse["id"])
-            nurse_requests = requests.get(nurse_id, {})
-
-            for d in D:
-                # H1: Night -> next day is Ake
-                if d < num_days - 1:
-                    model.Add(shifts[(n, d + 1)] == AKE).OnlyEnforceIf(is_night[(n, d)])
-                    model.Add(shifts[(n, d + 1)] == KAN_AKE).OnlyEnforceIf(is_kan_night[(n, d)])
-
-                # H2: Ake -> next day is Off
-                if d < num_days - 1:
-                    model.Add(shifts[(n, d + 1)] == OFF).OnlyEnforceIf(is_ake[(n, d)])
-                    model.Add(shifts[(n, d + 1)] == OFF).OnlyEnforceIf(is_kan_ake[(n, d)])
-
-            # H3: Consecutive working days limit
-            for d in D:
-                window = max_consec + 1
-                if d + window <= num_days:
-                    model.Add(sum(is_working[(n, d + k)] for k in range(window)) <= max_consec)
-
-            # H3 extended: account for previous month consecutive days
+            nurse_reqs = requests.get(nurse_id, {})
             prev_nurse = prev_month.get(nurse_id, {})
+
+            for d in D:
+                # H2: 夜勤→翌日は明
+                if d < num_days - 1:
+                    model.add(shifts[(n, d + 1)] == AKE).only_enforce_if(is_night[(n, d)])
+                # H3: 管夜→翌日は管明
+                if d < num_days - 1:
+                    model.add(shifts[(n, d + 1)] == KAN_AKE).only_enforce_if(is_kan_night[(n, d)])
+                # H4: 明→翌日は休
+                if d < num_days - 1:
+                    model.add(shifts[(n, d + 1)] == OFF).only_enforce_if(is_ake[(n, d)])
+                # H5: 管明→翌日は休
+                if d < num_days - 1:
+                    model.add(shifts[(n, d + 1)] == OFF).only_enforce_if(is_kan_ake[(n, d)])
+
+            # H13/H14: 月末の夜勤・管夜禁止
+            # 最終日: 夜勤不可（翌日に明が必要）
+            model.add(is_night[(n, num_days - 1)] == 0)
+            model.add(is_kan_night[(n, num_days - 1)] == 0)
+            # 最終日-1: 夜勤不可（明→休が月内に収まらない）
+            if num_days >= 2:
+                model.add(is_night[(n, num_days - 2)] == 0)
+                model.add(is_kan_night[(n, num_days - 2)] == 0)
+
+            # H6: 連続勤務日数制限
+            window = max_consec + 1
+            for d in D:
+                if d + window <= num_days:
+                    model.add(sum(is_working[(n, d + k)] for k in range(window)) <= max_consec)
+
+            # H6 extended: 前月連続勤務引き継ぎ
             prev_consec = prev_nurse.get("_consecDays", 0)
             if prev_consec > 0:
                 remaining = max_consec - prev_consec
                 if remaining <= 0:
-                    # Must not work on day 0
-                    model.Add(is_working[(n, 0)] == 0)
+                    model.add(is_working[(n, 0)] == 0)
                 else:
-                    # Limit first `remaining+1` days
                     for end_d in range(1, min(remaining + 1, num_days)):
-                        model.Add(
-                            sum(is_working[(n, k)] for k in range(end_d + 1)) <= remaining
-                        )
+                        model.add(sum(is_working[(n, k)] for k in range(end_d + 1)) <= remaining)
 
-            # H4: No 3 consecutive night shifts (夜明夜明夜 pattern forbidden)
+            # H7: 3連夜勤禁止 (夜明夜明夜)
             for d in range(num_days - 4):
-                b = model.NewBoolVar(f"triple_night_n{n}_d{d}")
-                model.AddBoolAnd([is_night[(n, d)], is_night[(n, d + 2)], is_night[(n, d + 4)]]).OnlyEnforceIf(b)
-                model.Add(b == 0)
+                model.add_bool_or([
+                    is_night[(n, d)].negated(),
+                    is_night[(n, d + 2)].negated(),
+                    is_night[(n, d + 4)].negated(),
+                ])
 
-            # H6: No night shift restriction
+            # H9: 夜勤なし設定
             if nurse.get("noNightShift", False):
                 for d in D:
-                    model.Add(is_night[(n, d)] == 0)
-                    model.Add(is_kan_night[(n, d)] == 0)
+                    model.add(is_night[(n, d)] == 0)
+                    model.add(is_kan_night[(n, d)] == 0)
 
-            # H7: No day shift restriction
+            # H10: 日勤なし設定
             if nurse.get("noDayShift", False):
                 for d in D:
-                    model.Add(is_day[(n, d)] == 0)
+                    model.add(is_day[(n, d)] == 0)
 
-            # H9: Hard request constraints (休, 有)
-            for day_str, req_type in nurse_requests.items():
+            # H11: 希望の「休」「有」はハード制約
+            for day_str, req_type in nurse_reqs.items():
                 day_idx = int(day_str) - 1
-                if 0 <= day_idx < num_days and req_type in HARD_REQUEST:
-                    model.Add(shifts[(n, day_idx)] == OFF)
+                if 0 <= day_idx < num_days and req_type in HARD_REQUESTS:
+                    target = REQUEST_MAP[req_type]
+                    model.add(shifts[(n, day_idx)] == target)
 
-        # H5: Night NG pairs
+            # H12: 前月制約の固定シフト
+            for key, val in prev_nurse.items():
+                if key.startswith("_"):
+                    continue
+                day_idx = int(key) - 1
+                if 0 <= day_idx < num_days and val in REQUEST_MAP:
+                    model.add(shifts[(n, day_idx)] == REQUEST_MAP[val])
+
+            # H15: 夜勤回数上限（管夜はカウントしない）
+            nurse_max_night = nurse.get("maxNightShifts", max_night)
+            model.add(sum(is_night[(n, d)] for d in D) <= nurse_max_night)
+
+        # H8: 夜勤NGペア
         for pair in night_ng_pairs:
             id_a, id_b = pair[0], pair[1]
             idx_a = next((i for i, nn in enumerate(active_nurses) if nn["id"] == id_a), None)
             idx_b = next((i for i, nn in enumerate(active_nurses) if nn["id"] == id_b), None)
             if idx_a is not None and idx_b is not None:
                 for d in D:
-                    model.AddBoolOr([is_night[(idx_a, d)].Not(), is_night[(idx_b, d)].Not()])
+                    model.add_bool_or([is_night[(idx_a, d)].negated(), is_night[(idx_b, d)].negated()])
 
-        # H8: Previous month fixed shifts
-        for nurse_id_str, prev_data in prev_month.items():
-            n_idx = next((i for i, nn in enumerate(active_nurses) if str(nn["id"]) == nurse_id_str), None)
-            if n_idx is None:
-                continue
-            for key, val in prev_data.items():
-                if key.startswith("_"):
-                    continue
-                # key is a day number (1-indexed), val is the shift type
-                day_idx = int(key) - 1
-                if 0 <= day_idx < num_days and val in REQUEST_MAP:
-                    model.Add(shifts[(n_idx, day_idx)] == REQUEST_MAP[val])
+        # ── Soft Constraints (Penalties) ──
+        penalties: list[tuple] = []
 
-        # --- Soft Constraints (Penalties) ---
-        penalties = []
-
-        # S1: Night shift staffing per day
+        # S1: 各日の夜勤人数（管夜を除く）
         for d in D:
-            pattern_idx = d % len(night_pattern)
-            required_night = night_pattern[pattern_idx]
+            required = night_req_table[d]
             total_night = sum(is_night[(n, d)] for n in N)
-            over = model.NewIntVar(0, num_nurses, f"night_over_d{d}")
-            under = model.NewIntVar(0, num_nurses, f"night_under_d{d}")
-            model.Add(total_night - required_night == over - under)
+            over = model.new_int_var(0, num_nurses, f"no_{d}")
+            under = model.new_int_var(0, num_nurses, f"nu_{d}")
+            model.add(total_night - required == over - under)
             penalties.append((over, 1000))
             penalties.append((under, 1000))
 
-        # S2: Day shift staffing per day
+        # S2: 各日の日勤人数
         for d in D:
-            required_day = weekend_day_staff if d in weekends else weekday_day_staff
+            required = weekend_day_staff if d in weekends else weekday_day_staff
             total_day = sum(is_day[(n, d)] for n in N)
-            over = model.NewIntVar(0, num_nurses, f"day_over_d{d}")
-            under = model.NewIntVar(0, num_nurses, f"day_under_d{d}")
-            model.Add(total_day - required_day == over - under)
+            over = model.new_int_var(0, num_nurses, f"do_{d}")
+            under = model.new_int_var(0, num_nurses, f"du_{d}")
+            model.add(total_day - required == over - under)
             penalties.append((over, 500))
             penalties.append((under, 500))
 
-        # S3: Night shift balance across nurses
+        # S3: 夜勤回数の均等化（管夜を除く）
         night_counts = []
         for n in N:
-            nurse = active_nurses[n]
-            nc = model.NewIntVar(0, num_days, f"night_count_n{n}")
-            model.Add(nc == sum(is_night[(n, d)] for d in D))
+            nc = model.new_int_var(0, num_days, f"nc_{n}")
+            model.add(nc == sum(is_night[(n, d)] for d in D))
             night_counts.append(nc)
-
         if len(night_counts) > 1:
-            max_nc = model.NewIntVar(0, num_days, "max_night_count")
-            min_nc = model.NewIntVar(0, num_days, "min_night_count")
-            model.AddMaxEquality(max_nc, night_counts)
-            model.AddMinEquality(min_nc, night_counts)
-            night_diff = model.NewIntVar(0, num_days, "night_diff")
-            model.Add(night_diff == max_nc - min_nc)
-            penalties.append((night_diff, 300))
+            max_nc = model.new_int_var(0, num_days, "max_nc")
+            min_nc = model.new_int_var(0, num_days, "min_nc")
+            model.add_max_equality(max_nc, night_counts)
+            model.add_min_equality(min_nc, night_counts)
+            diff = model.new_int_var(0, num_days, "nc_diff")
+            model.add(diff == max_nc - min_nc)
+            penalties.append((diff, 300))
 
-        # S4: Night shift distribution within month (spread out)
+        # S4: 夜勤の月内分散
+        seg_len = num_days // 3
         for n in N:
-            # Divide month into 3 segments and balance night counts
-            seg_len = num_days // 3
             segs = []
             for s in range(3):
                 start = s * seg_len
                 end = (s + 1) * seg_len if s < 2 else num_days
-                seg_count = model.NewIntVar(0, num_days, f"seg_night_n{n}_s{s}")
-                model.Add(seg_count == sum(is_night[(n, d)] for d in range(start, end)))
-                segs.append(seg_count)
-            for i in range(len(segs)):
-                for j in range(i + 1, len(segs)):
-                    diff = model.NewIntVar(0, num_days, f"seg_diff_n{n}_{i}_{j}")
-                    model.AddAbsEquality(diff, segs[i] - segs[j])
-                    penalties.append((diff, 50))
+                sc = model.new_int_var(0, num_days, f"seg_{n}_{s}")
+                model.add(sc == sum(is_night[(n, d)] for d in range(start, end)))
+                segs.append(sc)
+            for i in range(3):
+                for j in range(i + 1, 3):
+                    d_var = model.new_int_var(0, num_days, f"sd_{n}_{i}_{j}")
+                    model.add_abs_equality(d_var, segs[i] - segs[j])
+                    penalties.append((d_var, 50))
 
-        # S5: Double night pair limit
+        # S5: 2連夜勤ペア上限
         for n in N:
-            double_night_count = model.NewIntVar(0, num_days, f"double_night_n{n}")
-            double_night_bools = []
+            dbl_bools = []
             for d in range(num_days - 2):
-                # Night on d and night on d+2 means double night pair (夜明夜)
-                b = model.NewBoolVar(f"dbl_night_n{n}_d{d}")
-                model.AddBoolAnd([is_night[(n, d)], is_night[(n, d + 2)]]).OnlyEnforceIf(b)
-                model.AddBoolOr([is_night[(n, d)].Not(), is_night[(n, d + 2)].Not()]).OnlyEnforceIf(b.Not())
-                double_night_bools.append(b)
-            model.Add(double_night_count == sum(double_night_bools))
-            excess = model.NewIntVar(0, num_days, f"dbl_night_excess_n{n}")
-            model.Add(excess >= double_night_count - max_double_night)
-            model.Add(excess >= 0)
+                b = model.new_bool_var(f"db_{n}_{d}")
+                model.add_bool_and([is_night[(n, d)], is_night[(n, d + 2)]]).only_enforce_if(b)
+                model.add_bool_or([is_night[(n, d)].negated(), is_night[(n, d + 2)].negated()]).only_enforce_if(b.negated())
+                dbl_bools.append(b)
+            dbl_count = model.new_int_var(0, num_days, f"dbc_{n}")
+            model.add(dbl_count == sum(dbl_bools))
+            excess = model.new_int_var(0, num_days, f"dbe_{n}")
+            model.add(excess >= dbl_count - max_double_night)
+            model.add(excess >= 0)
             penalties.append((excess, 500))
 
-        # S6: Days off count target
+        # S6: 休日数（休+有のみ。明・管明は含めない）
         for n in N:
-            off_count = model.NewIntVar(0, num_days, f"off_count_n{n}")
-            # Off = OFF or AKE or KAN_AKE or NULL(0) ... actually count only explicit OFF
-            # Count non-working days: off + ake + kan_ake
-            all_off = []
-            for d in D:
-                not_work = model.NewBoolVar(f"not_work_n{n}_d{d}")
-                model.AddBoolOr([is_off[(n, d)], is_ake[(n, d)], is_kan_ake[(n, d)]]).OnlyEnforceIf(not_work)
-                model.AddBoolAnd([is_off[(n, d)].Not(), is_ake[(n, d)].Not(), is_kan_ake[(n, d)].Not()]).OnlyEnforceIf(not_work.Not())
-                all_off.append(not_work)
-            model.Add(off_count == sum(all_off))
-            off_over = model.NewIntVar(0, num_days, f"off_over_n{n}")
-            off_under = model.NewIntVar(0, num_days, f"off_under_n{n}")
-            model.Add(off_count - max_days_off == off_over - off_under)
+            off_cnt = model.new_int_var(0, num_days, f"oc_{n}")
+            model.add(off_cnt == sum(is_off[(n, d)] + is_yu[(n, d)] for d in D))
+            off_over = model.new_int_var(0, num_days, f"oo_{n}")
+            off_under = model.new_int_var(0, num_days, f"ou_{n}")
+            model.add(off_cnt - max_days_off == off_over - off_under)
             penalties.append((off_over, 200))
             penalties.append((off_under, 200))
 
-        # S7: Soft request constraints (日, 夜 etc.)
-        soft_bonuses = []
+        # S7: 希望の「日」「夜」等はソフト制約
+        soft_bonuses: list = []
         for n in N:
-            nurse = active_nurses[n]
-            nurse_id = str(nurse["id"])
-            nurse_requests_map = requests.get(nurse_id, {})
-            for day_str, req_type in nurse_requests_map.items():
+            nurse_id = str(active_nurses[n]["id"])
+            nurse_reqs = requests.get(nurse_id, {})
+            for day_str, req_type in nurse_reqs.items():
                 day_idx = int(day_str) - 1
-                if 0 <= day_idx < num_days and req_type not in HARD_REQUEST and req_type in REQUEST_MAP:
-                    target = REQUEST_MAP[req_type]
-                    matched = model.NewBoolVar(f"soft_req_n{n}_d{day_idx}")
-                    model.Add(shifts[(n, day_idx)] == target).OnlyEnforceIf(matched)
-                    model.Add(shifts[(n, day_idx)] != target).OnlyEnforceIf(matched.Not())
+                if 0 <= day_idx < num_days and req_type not in HARD_REQUESTS and req_type in REQUEST_MAP:
+                    matched = model.new_bool_var(f"sr_{n}_{day_idx}")
+                    model.add(shifts[(n, day_idx)] == REQUEST_MAP[req_type]).only_enforce_if(matched)
+                    model.add(shifts[(n, day_idx)] != REQUEST_MAP[req_type]).only_enforce_if(matched.negated())
                     soft_bonuses.append(matched)
 
-        # --- Forbidden previous solutions ---
+        # ── Forbid previous solutions ──
         for forbidden in forbidden_solutions:
             diffs = []
             for n in N:
-                nurse_id = str(active_nurses[n]["id"])
-                if nurse_id in forbidden:
+                nid = str(active_nurses[n]["id"])
+                if nid in forbidden:
                     for d in D:
-                        prev_val = forbidden[nurse_id][d]
-                        b = model.NewBoolVar(f"diff_pat{pat_idx}_n{n}_d{d}")
-                        model.Add(shifts[(n, d)] != prev_val).OnlyEnforceIf(b)
-                        model.Add(shifts[(n, d)] == prev_val).OnlyEnforceIf(b.Not())
+                        b = model.new_bool_var(f"fb_{pat_idx}_{n}_{d}")
+                        model.add(shifts[(n, d)] != forbidden[nid][d]).only_enforce_if(b)
+                        model.add(shifts[(n, d)] == forbidden[nid][d]).only_enforce_if(b.negated())
                         diffs.append(b)
             if diffs:
-                model.Add(sum(diffs) >= 1)
+                model.add(sum(diffs) >= max(1, num_nurses))  # require meaningful difference
 
-        # --- Objective ---
-        total_penalty = model.NewIntVar(0, 10000000, "total_penalty")
-        model.Add(total_penalty == sum(var * weight for var, weight in penalties))
+        # ── Objective ──
+        total_penalty = sum(var * w for var, w in penalties)
+        bonus = sum(b * 200 for b in soft_bonuses) if soft_bonuses else 0
+        model.minimize(total_penalty - bonus)
 
-        bonus_sum = model.NewIntVar(0, 10000000, "bonus_sum")
-        if soft_bonuses:
-            model.Add(bonus_sum == sum(b * 200 for b in soft_bonuses))
-        else:
-            model.Add(bonus_sum == 0)
-
-        score_var = model.NewIntVar(-10000000, 10000000, "score")
-        model.Add(score_var == 10000 - total_penalty + bonus_sum)
-
-        model.Minimize(total_penalty - bonus_sum)
-
-        # --- Solve ---
+        # ── Solve ──
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = 30
         solver.parameters.num_workers = 4
 
-        status = solver.Solve(model)
+        status = solver.solve(model)
 
         if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            solution_data = {}
-            solution_raw = {}
+            solution_data: dict[str, list] = {}
+            solution_raw: dict[str, list[int]] = {}
             for n in N:
-                nurse_id = str(active_nurses[n]["id"])
-                schedule = []
-                raw = []
-                for d in D:
-                    val = solver.Value(shifts[(n, d)])
-                    raw.append(val)
-                    schedule.append(SHIFT_LABELS.get(val, ""))
-                solution_data[nurse_id] = schedule
-                solution_raw[nurse_id] = raw
+                nid = str(active_nurses[n]["id"])
+                raw = [solver.value(shifts[(n, d)]) for d in D]
+                solution_data[nid] = [SHIFT_LABELS.get(v, "") for v in raw]
+                solution_raw[nid] = raw
 
             forbidden_solutions.append(solution_raw)
 
-            # Calculate metrics
-            night_counts_vals = []
-            total_request_count = 0
-            matched_request_count = 0
-            total_day_shortage = 0
+            # ── Metrics ──
+            night_vals = []
+            total_req = 0
+            matched_req = 0
             total_night_shortage = 0
+            total_day_shortage = 0
             consec_violations = 0
-            total_off_days = 0
+            null_cells = 0
 
             for n in N:
-                nurse_id = str(active_nurses[n]["id"])
-                nc = sum(1 for d in D if solver.Value(shifts[(n, d)]) == NIGHT)
-                night_counts_vals.append(nc)
-
-                # Count off days
-                off_d = sum(1 for d in D if solver.Value(shifts[(n, d)]) in (OFF, AKE, KAN_AKE))
-                total_off_days += off_d
+                nid = str(active_nurses[n]["id"])
+                nc = sum(1 for d in D if solver.value(shifts[(n, d)]) == NIGHT)
+                night_vals.append(nc)
 
                 # Request matching
-                nurse_requests_map = requests.get(nurse_id, {})
-                for day_str, req_type in nurse_requests_map.items():
-                    day_idx = int(day_str) - 1
-                    if 0 <= day_idx < num_days and req_type in REQUEST_MAP:
-                        total_request_count += 1
-                        if solver.Value(shifts[(n, day_idx)]) == REQUEST_MAP[req_type]:
-                            matched_request_count += 1
+                nr = requests.get(nid, {})
+                for ds, rt in nr.items():
+                    di = int(ds) - 1
+                    if 0 <= di < num_days and rt in REQUEST_MAP:
+                        total_req += 1
+                        if solver.value(shifts[(n, di)]) == REQUEST_MAP[rt]:
+                            matched_req += 1
 
                 # Consecutive violations
                 consec = 0
                 for d in D:
-                    if solver.Value(shifts[(n, d)]) in (DAY, NIGHT, KAN_NIGHT):
+                    v = solver.value(shifts[(n, d)])
+                    if v in WORK_SHIFTS:
                         consec += 1
                         if consec > max_consec:
                             consec_violations += 1
                     else:
                         consec = 0
 
+                # Null cell check
+                for d in D:
+                    label = SHIFT_LABELS.get(solver.value(shifts[(n, d)]))
+                    if label is None or label == "":
+                        null_cells += 1
+
             for d in D:
-                pattern_idx = d % len(night_pattern)
-                required_night = night_pattern[pattern_idx]
-                actual_night = sum(1 for n in N if solver.Value(shifts[(n, d)]) == NIGHT)
-                if actual_night < required_night:
-                    total_night_shortage += required_night - actual_night
+                actual_night = sum(1 for n in N if solver.value(shifts[(n, d)]) == NIGHT)
+                if actual_night < night_req_table[d]:
+                    total_night_shortage += night_req_table[d] - actual_night
+                req_day = weekend_day_staff if d in weekends else weekday_day_staff
+                actual_day = sum(1 for n in N if solver.value(shifts[(n, d)]) == DAY)
+                if actual_day < req_day:
+                    total_day_shortage += req_day - actual_day
 
-                required_day = weekend_day_staff if d in weekends else weekday_day_staff
-                actual_day = sum(1 for n in N if solver.Value(shifts[(n, d)]) == DAY)
-                if actual_day < required_day:
-                    total_day_shortage += required_day - actual_day
+            night_balance = (max(night_vals) - min(night_vals)) if night_vals else 0
+            req_match = (matched_req / total_req * 100) if total_req > 0 else 100.0
 
-            night_balance = (max(night_counts_vals) - min(night_counts_vals)) if night_counts_vals else 0
-            request_match = (matched_request_count / total_request_count * 100) if total_request_count > 0 else 100.0
-            avg_days_off = total_off_days / num_nurses if num_nurses > 0 else 0
+            # Compute off days (休+有 only)
+            total_off = sum(
+                sum(1 for d in D if solver.value(shifts[(n, d)]) in (OFF, YU))
+                for n in N
+            )
+            avg_off = total_off / num_nurses if num_nurses > 0 else 0
 
-            score = solver.Value(score_var)
+            score = 10000 - solver.objective_value
 
             results.append({
                 "label": pattern_labels[pat_idx] if pat_idx < len(pattern_labels) else f"パターン{pat_idx + 1}",
                 "data": solution_data,
-                "score": score,
+                "score": int(score),
                 "metrics": {
                     "nightBalance": round(night_balance, 1),
                     "dayShortage": total_day_shortage,
                     "nightShortage": total_night_shortage,
                     "consecViolations": consec_violations,
-                    "requestMatch": round(request_match, 1),
-                    "avgDaysOff": round(avg_days_off, 1),
+                    "requestMatch": round(req_match, 1),
+                    "avgDaysOff": round(avg_off, 1),
+                    "nullCells": null_cells,
                 },
             })
         else:
@@ -406,14 +457,7 @@ def solve_schedule(request_data: dict) -> list[dict]:
                 "label": pattern_labels[pat_idx] if pat_idx < len(pattern_labels) else f"パターン{pat_idx + 1}",
                 "data": {},
                 "score": 0,
-                "metrics": {
-                    "nightBalance": 0,
-                    "dayShortage": 0,
-                    "nightShortage": 0,
-                    "consecViolations": 0,
-                    "requestMatch": 0,
-                    "avgDaysOff": 0,
-                },
+                "metrics": {"error": f"Solver status: {solver.status_name(status)}"},
             })
 
     return results
