@@ -104,13 +104,13 @@ def test_solver():
             if s == "管夜" and d + 1 < len(shifts) and shifts[d + 1] != "管明":
                 errors.append(f"Nurse {nid} Day {d+1}: 管夜の翌日が管明でない({shifts[d+1]})")
 
-            # 明→休 check
+            # 明→休or有 check
             if s == "明" and d + 1 < len(shifts) and shifts[d + 1] not in ("休", "有"):
-                errors.append(f"Nurse {nid} Day {d+1}: 明の翌日が休でない({shifts[d+1]})")
+                errors.append(f"Nurse {nid} Day {d+1}: 明の翌日が休or有でない({shifts[d+1]})")
 
-            # 管明→休 check
+            # 管明→休or有 check
             if s == "管明" and d + 1 < len(shifts) and shifts[d + 1] not in ("休", "有"):
-                errors.append(f"Nurse {nid} Day {d+1}: 管明の翌日が休でない({shifts[d+1]})")
+                errors.append(f"Nurse {nid} Day {d+1}: 管明の翌日が休or有でない({shifts[d+1]})")
 
         # Consecutive working days check
         work_shifts = {"日", "夜", "管夜"}

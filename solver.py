@@ -169,12 +169,24 @@ def solve_schedule(request_data: dict) -> list[dict]:
                 # H3: 管夜→翌日は管明
                 if d < num_days - 1:
                     model.add(shifts[(n, d + 1)] == KAN_AKE).only_enforce_if(is_kan_night[(n, d)])
-                # H4: 明→翌日は休
+                # H4: 明→翌日は休or有
                 if d < num_days - 1:
-                    model.add(shifts[(n, d + 1)] == OFF).only_enforce_if(is_ake[(n, d)])
-                # H5: 管明→翌日は休
+                    ake_next_off = model.new_bool_var(f"ano_{n}_{d}")
+                    ake_next_yu = model.new_bool_var(f"any_{n}_{d}")
+                    model.add(shifts[(n, d + 1)] == OFF).only_enforce_if(ake_next_off)
+                    model.add(shifts[(n, d + 1)] != OFF).only_enforce_if(ake_next_off.negated())
+                    model.add(shifts[(n, d + 1)] == YU).only_enforce_if(ake_next_yu)
+                    model.add(shifts[(n, d + 1)] != YU).only_enforce_if(ake_next_yu.negated())
+                    model.add(ake_next_off + ake_next_yu >= 1).only_enforce_if(is_ake[(n, d)])
+                # H5: 管明→翌日は休or有
                 if d < num_days - 1:
-                    model.add(shifts[(n, d + 1)] == OFF).only_enforce_if(is_kan_ake[(n, d)])
+                    kane_next_off = model.new_bool_var(f"kno_{n}_{d}")
+                    kane_next_yu = model.new_bool_var(f"kny_{n}_{d}")
+                    model.add(shifts[(n, d + 1)] == OFF).only_enforce_if(kane_next_off)
+                    model.add(shifts[(n, d + 1)] != OFF).only_enforce_if(kane_next_off.negated())
+                    model.add(shifts[(n, d + 1)] == YU).only_enforce_if(kane_next_yu)
+                    model.add(shifts[(n, d + 1)] != YU).only_enforce_if(kane_next_yu.negated())
+                    model.add(kane_next_off + kane_next_yu >= 1).only_enforce_if(is_kan_ake[(n, d)])
 
             # H13/H14: 月末の夜勤・管夜禁止
             # 最終日: 夜勤不可（翌日に明が必要）
@@ -371,8 +383,13 @@ def solve_schedule(request_data: dict) -> list[dict]:
             solution_raw: dict[str, list[int]] = {}
             for n in N:
                 nid = str(active_nurses[n]["id"])
-                raw = [solver.value(shifts[(n, d)]) for d in D]
-                solution_data[nid] = [SHIFT_LABELS.get(v, "") for v in raw]
+                raw = []
+                for d in D:
+                    v = solver.value(shifts[(n, d)])
+                    if v < 1 or v > 7:
+                        v = OFF  # フォールバック: 不正値は休にする
+                    raw.append(v)
+                solution_data[nid] = [SHIFT_LABELS.get(v, "休") for v in raw]
                 solution_raw[nid] = raw
 
             forbidden_solutions.append(solution_raw)
@@ -453,11 +470,20 @@ def solve_schedule(request_data: dict) -> list[dict]:
                 },
             })
         else:
+            status_name = solver.status_name(status)
+            if status_name == "INFEASIBLE":
+                err_msg = "制約が厳しすぎて解が存在しません。希望や夜勤回数上限を見直してください"
+            elif status_name == "MODEL_INVALID":
+                err_msg = "モデルが不正です。入力データを確認してください"
+            elif status_name == "UNKNOWN":
+                err_msg = "時間内に解が見つかりませんでした。制約を緩めるか再実行してください"
+            else:
+                err_msg = f"Solver status: {status_name}"
             results.append({
                 "label": pattern_labels[pat_idx] if pat_idx < len(pattern_labels) else f"パターン{pat_idx + 1}",
                 "data": {},
                 "score": 0,
-                "metrics": {"error": f"Solver status: {solver.status_name(status)}"},
+                "metrics": {"error": err_msg, "solverStatus": status_name},
             })
 
     return results
