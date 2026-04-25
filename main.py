@@ -37,9 +37,9 @@ async def solve(request: Request):
 
 @app.get("/test")
 def test_solver():
-    """Run a quality-check test with 10 nurses × 28 days (Feb)."""
+    """Run a quality-check test with 10 nurses × 31 days (Jan 2026)."""
 
-    # Build test data
+    num_days = 31
     nurses = [
         {
             "id": i, "name": f"看護師{i}", "position": "一般",
@@ -63,14 +63,13 @@ def test_solver():
         "3": {"15": "休"},
     }
     night_ng_pairs = [[1, 2]]
-    # February 2026 weekends (0-indexed): Sat=6,Sun=0 → day indices
     weekends = [3, 4, 10, 11, 17, 18, 24, 25]
 
     test_input = {
         "nurses": nurses,
-        "daysInMonth": 28,
+        "daysInMonth": num_days,
         "year": 2026,
-        "month": 1,  # 0-indexed: February
+        "month": 0,  # 0-indexed: January
         "config": config,
         "requests": requests_data,
         "nightNgPairs": night_ng_pairs,
@@ -133,7 +132,7 @@ def test_solver():
 
     # Daily staffing summary
     daily_summary = []
-    for d in range(28):
+    for d in range(num_days):
         night_count = sum(1 for shifts in data.values() if shifts[d] == "夜")
         kan_night_count = sum(1 for shifts in data.values() if shifts[d] == "管夜")
         day_count = sum(1 for shifts in data.values() if shifts[d] == "日")
@@ -149,7 +148,7 @@ def test_solver():
     for nid_str, reqs in requests_data.items():
         for day_str, req_type in reqs.items():
             day_idx = int(day_str) - 1
-            actual = data.get(nid_str, [None] * 28)[day_idx] if nid_str in data else None
+            actual = data.get(nid_str, [None] * num_days)[day_idx] if nid_str in data else None
             expected = req_type
             matched = actual == expected
             req_checks.append({
@@ -157,7 +156,7 @@ def test_solver():
                 "requested": expected, "actual": actual, "matched": matched,
             })
 
-    # Night shift counts per nurse
+    # Night shift counts per nurse (管夜は除外)
     night_per_nurse = {}
     for nid, shifts in data.items():
         night_per_nurse[nid] = sum(1 for s in shifts if s == "夜")
@@ -167,7 +166,7 @@ def test_solver():
     for pair in night_ng_pairs:
         a, b = str(pair[0]), str(pair[1])
         if a in data and b in data:
-            for d in range(28):
+            for d in range(num_days):
                 if data[a][d] == "夜" and data[b][d] == "夜":
                     ng_violations.append(f"Day {d+1}: Nurse {a} and {b} both on night")
 
