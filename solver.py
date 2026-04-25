@@ -401,7 +401,7 @@ def _solve_one_pattern(params, forbidden_solutions, relax_level=0):
         model.minimize(total_penalty)
 
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = 30
+    solver.parameters.max_time_in_seconds = 10
     solver.parameters.num_workers = 4
 
     status = solver.solve(model)
