@@ -173,13 +173,13 @@ def _solve_one_pattern(params, forbidden_solutions, relax_level=0):
     for (n, d), val in forced_shift.items():
         model.add(shifts[(n, d)] == val)
 
-    # ── ハード制約: 夜→翌日OFF / 夜→翌々日 NOT DAY ──
+    # ── ハード制約: 夜→翌日OFF(明) / 夜→翌々日OFF(休) ──
     for n in N:
         for d in D:
             if d + 1 < num_days:
                 model.add(is_off[(n, d + 1)] == 1).only_enforce_if(is_night[(n, d)])
             if d + 2 < num_days:
-                model.add(is_day[(n, d + 2)] == 0).only_enforce_if(is_night[(n, d)])
+                model.add(is_off[(n, d + 2)] == 1).only_enforce_if(is_night[(n, d)])
 
     # ── ハード制約: forced 休/有 の前日に NIGHT を置かない ──
     # (置くと post-proc で 夜→休 となり 夜→明 invariant が崩れる)
@@ -196,13 +196,10 @@ def _solve_one_pattern(params, forbidden_solutions, relax_level=0):
                 is_night[(n, d + 4)].negated(),
             ])
 
-    # ── 月末夜勤禁止 (forced夜は除く) ──
+    # ── 月末夜勤禁止 - 最終日のみ（明は最終日翌＝月外OK、休はその次＝月外OK）──
     for n in N:
-        for d in (num_days - 1, num_days - 2):
-            if d < 0 or d >= num_days:
-                continue
-            if forced_shift.get((n, d)) == NIGHT:
-                continue
+        d = num_days - 1
+        if 0 <= d < num_days and forced_shift.get((n, d)) != NIGHT:
             model.add(is_night[(n, d)] == 0)
 
     # ── 連続勤務制限 ──
@@ -254,7 +251,9 @@ def _solve_one_pattern(params, forbidden_solutions, relax_level=0):
         if real_night_terms:
             model.add(sum(real_night_terms) <= nurse_max_night)
 
-    # ── 夜勤人数（ハード／緩和あり）──
+    # ── 夜勤人数（ハード／relax_level=2で緩和）──
+    # relax_level 0,1: 完全一致 (== required)
+    # relax_level 2  : ±1 緩和 + ペナルティ
     night_dev_penalties = []
     for d in D:
         required = night_req_table[d]
@@ -262,19 +261,20 @@ def _solve_one_pattern(params, forbidden_solutions, relax_level=0):
         if not terms:
             continue
         total = sum(terms)
-        if relax_level == 0:
+        if relax_level < 2:
             model.add(total == required)
         else:
             model.add(total >= max(0, required - 1))
             model.add(total <= required + 1)
-            # 緩和時も要件への追従を強くペナルティ
             diff = model.new_int_var(-num_nurses, num_nurses, f"nd_{d}")
             model.add(diff == total - required)
             abs_diff = model.new_int_var(0, num_nurses, f"and_{d}")
             model.add_abs_equality(abs_diff, diff)
             night_dev_penalties.append((abs_diff, 5000))
 
-    # ── 日勤人数（ハード／緩和あり）──
+    # ── 日勤人数（ハード／relax_level≥1で緩和）──
+    # relax_level 0  : >= required
+    # relax_level 1+ : >= required-1 + ペナルティ
     day_short_penalties = []
     for d in D:
         required = weekend_day_staff if d in weekends else weekday_day_staff
@@ -454,7 +454,8 @@ def _post_process(solution_raw, active_nurses, forced_label, num_days):
     return output
 
 
-def _validate(data, params):
+def _validate(data, params, relax_level=0):
+    """構造エラーは常にチェック。人数要件は relax_level に応じて緩める。"""
     errors = []
     num_days = params["num_days"]
     night_req_table = params["night_req_table"]
@@ -478,16 +479,24 @@ def _validate(data, params):
             if s == "管明" and d + 1 < len(sh) and sh[d + 1] not in ("休", "有"):
                 errors.append(f"Nurse {nid} Day {d+1}: 管明の翌日が休/有以外({sh[d+1]})")
 
+    # 夜勤人数: relax_level<2 で完全一致要求、relax_level>=2 で ±1 許容
     for d in range(num_days):
         actual = sum(1 for sh in data.values() if sh[d] == "夜")
-        if actual != night_req_table[d]:
-            errors.append(f"Day {d+1}: 夜勤人数 {actual} ≠ 要件 {night_req_table[d]}")
+        req = night_req_table[d]
+        if relax_level < 2:
+            if actual != req:
+                errors.append(f"Day {d+1}: 夜勤人数 {actual} ≠ 要件 {req}")
+        else:
+            if abs(actual - req) > 1:
+                errors.append(f"Day {d+1}: 夜勤人数 {actual} (要件 {req}, 許容±1超過)")
 
+    # 日勤人数: relax_level==0 で完全要求、relax_level>=1 で -1 許容
     for d in range(num_days):
         actual = sum(1 for sh in data.values() if sh[d] == "日")
         req = weekend_day_staff if d in weekends else weekday_day_staff
-        if actual < req:
-            errors.append(f"Day {d+1}: 日勤人数 {actual} < 要件 {req}")
+        threshold = req if relax_level == 0 else max(0, req - 1)
+        if actual < threshold:
+            errors.append(f"Day {d+1}: 日勤人数 {actual} < 要件 {threshold}")
 
     for nid, sh in data.items():
         consec = 0
@@ -540,10 +549,9 @@ def solve_schedule(request_data: dict) -> list[dict]:
         year, month, num_days, night_pattern,
         start_with_three=config.get("startWithThree", False),
     )
-    # 月末2日は夜勤禁止 → 必要人数も0で整合させる
-    for d in (num_days - 1, num_days - 2):
-        if 0 <= d < num_days:
-            night_req_table[d] = 0
+    # 月末最終日のみ夜勤禁止 → 必要人数も0で整合させる
+    if 0 <= num_days - 1 < len(night_req_table):
+        night_req_table[num_days - 1] = 0
 
     forced_shift, forced_label = _build_forced(active_nurses, requests, prev_month, num_days)
 
@@ -577,28 +585,24 @@ def solve_schedule(request_data: dict) -> list[dict]:
         chosen_errors: list[str] = []
         last_status = None
 
-        # 試行: relax 0 → 1。各レベルで最大3回（解後validation失敗時のリトライ）
-        for relax_level in (0, 1):
-            for attempt in range(3):
-                res = _solve_one_pattern(params, forbidden_solutions, relax_level=relax_level)
-                last_status = res["status"]
-                if res["raw"] is None:
-                    break  # この緩和では解なし、次の緩和へ
-                final_data = _post_process(res["raw"], active_nurses, forced_label, num_days)
-                errors = _validate(final_data, params)
-                if not errors:
-                    chosen = {
-                        "raw": res["raw"],
-                        "data": final_data,
-                        "objective": res["objective"],
-                        "relax_level": relax_level,
-                    }
-                    break
-                # 同じ条件でリトライしても結果は同じなので即break
-                chosen_errors = errors
+        # 試行: relax 0(完全遵守) → 1(日勤緩和) → 2(日勤・夜勤緩和)
+        for relax_level in (0, 1, 2):
+            res = _solve_one_pattern(params, forbidden_solutions, relax_level=relax_level)
+            last_status = res["status"]
+            if res["raw"] is None:
+                continue  # この緩和では解なし、次の緩和へ
+            final_data = _post_process(res["raw"], active_nurses, forced_label, num_days)
+            errors = _validate(final_data, params, relax_level=relax_level)
+            if not errors:
+                chosen = {
+                    "raw": res["raw"],
+                    "data": final_data,
+                    "objective": res["objective"],
+                    "relax_level": relax_level,
+                }
                 break
-            if chosen is not None:
-                break
+            chosen_errors = errors
+            # validation失敗 → 次の緩和レベルへ
 
         if chosen is None:
             results.append({
@@ -606,6 +610,7 @@ def solve_schedule(request_data: dict) -> list[dict]:
                 "data": {},
                 "score": 0,
                 "metrics": {
+                    "solverUsed": True,
                     "error": f"解が見つかりませんでした (status={last_status})",
                     "solverStatus": last_status,
                     "validationErrors": chosen_errors[:10],
@@ -669,6 +674,8 @@ def solve_schedule(request_data: dict) -> list[dict]:
             "data": data,
             "score": int(score),
             "metrics": {
+                "solverUsed": True,
+                "relaxLevel": chosen["relax_level"],
                 "nightBalance": round(night_balance, 1),
                 "dayShortage": total_day_shortage,
                 "nightShortage": total_night_shortage,
@@ -676,7 +683,6 @@ def solve_schedule(request_data: dict) -> list[dict]:
                 "requestMatch": round(req_match, 1),
                 "avgDaysOff": round(avg_off, 1),
                 "nullCells": null_cells,
-                "relaxLevel": chosen["relax_level"],
             },
         })
 

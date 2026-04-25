@@ -37,12 +37,12 @@ async def solve(request: Request):
 
 @app.get("/test")
 def test_solver():
-    """品質チェック (10名 × 31日, 2026年1月)。
+    """品質チェック (24名 × 31日, 2026年3月、実運用に近い条件)。
 
     新solver仕様の検証:
       - 自動生成セル(=希望なし)に 管夜・管明・有 が出ない
       - 夜→明→休 / 管夜→管明→休 が100%守られる
-      - 各日の夜勤人数 == nightShiftPattern
+      - 各日の夜勤人数 == nightShiftPattern (最終日のみ 0)
       - 各日の日勤人数 >= weekday/weekendDayStaff
       - 連続勤務上限を超えない
       - 空白セルなし
@@ -52,15 +52,15 @@ def test_solver():
     nurses = [
         {
             "id": i, "name": f"看護師{i}", "position": "一般",
-            "noNightShift": False, "noDayShift": False,
+            "noNightShift": i > 20, "noDayShift": False,
             "maxNightShifts": 6, "excludeFromGeneration": False,
         }
-        for i in range(1, 11)
+        for i in range(1, 25)
     ]
     config = {
-        "weekdayDayStaff": 4,
-        "weekendDayStaff": 3,
-        "nightShiftPattern": [2, 2],
+        "weekdayDayStaff": 10,
+        "weekendDayStaff": 6,
+        "nightShiftPattern": [4, 4],
         "maxNightShifts": 6,
         "maxDaysOff": 10,
         "maxConsecutiveDays": 3,
@@ -72,13 +72,14 @@ def test_solver():
         "3": {"15": "休"},
     }
     night_ng_pairs = [[1, 2]]
-    weekends = [3, 4, 10, 11, 17, 18, 24, 25]
+    # 2026年3月の土日 (0-based)
+    weekends = [0, 6, 7, 13, 14, 20, 21, 27, 28]
 
     test_input = {
         "nurses": nurses,
         "daysInMonth": num_days,
         "year": 2026,
-        "month": 0,
+        "month": 2,
         "config": config,
         "requests": requests_data,
         "nightNgPairs": night_ng_pairs,
@@ -147,11 +148,9 @@ def test_solver():
         if max_consec_found > config["maxConsecutiveDays"]:
             errors.append(f"Nurse {nid}: 連続勤務{max_consec_found}日 (上限{config['maxConsecutiveDays']})")
 
-        # 月末夜勤
+        # 月末夜勤 (最終日のみ禁止)
         if shifts[-1] in ("夜", "管夜"):
             errors.append(f"Nurse {nid}: 最終日に夜勤")
-        if len(shifts) >= 2 and shifts[-2] in ("夜", "管夜"):
-            errors.append(f"Nurse {nid}: 最終日-1に夜勤")
 
     # 2. 日次 staffing チェック (ハード制約と同じ条件)
     daily_summary = []
@@ -160,8 +159,8 @@ def test_solver():
         kan_night_count = sum(1 for shifts in data.values() if shifts[d] == "管夜")
         day_count = sum(1 for shifts in data.values() if shifts[d] == "日")
 
-        # 月末2日は夜勤禁止 → 0が正解。それ以外は pattern=[2,2] で 2固定。
-        expected_night = 0 if d >= num_days - 2 else 2
+        # 最終日のみ夜勤禁止(=0)。それ以外は pattern=[4,4] で 4固定。
+        expected_night = 0 if d == num_days - 1 else 4
         if night_count != expected_night:
             errors.append(f"Day {d+1}: 夜勤人数 {night_count} ≠ {expected_night}")
 
