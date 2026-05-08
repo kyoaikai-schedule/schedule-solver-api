@@ -462,9 +462,24 @@ def _post_process(solution_raw, active_nurses, forced_label, num_days):
 
 
 def _preflight_diagnostics(active_nurses, night_req_table, weekday_day_staff,
-                            weekend_day_staff, weekends, num_days, max_night_default):
+                            weekend_day_staff, weekends, num_days, max_night_default,
+                            max_consec=3, max_days_off=10):
     """生成リクエストが数学的に成立し得るかを事前にチェックする。"""
     warnings: list[str] = []
+
+    # 0. パース済み入力の echo (フロントの送信値と diagnostics を突き合わせるため)
+    weekend_day_count = sum(1 for d in range(num_days) if d in weekends)
+    weekday_day_count = num_days - weekend_day_count
+    parsed_config = {
+        "weekdayDayStaff": weekday_day_staff,
+        "weekendDayStaff": weekend_day_staff,
+        "maxNightShiftsDefault": max_night_default,
+        "maxConsecutiveDays": max_consec,
+        "maxDaysOff": max_days_off,
+        "numDays": num_days,
+        "weekendCount": weekend_day_count,  # weekends ∩ [0, num_days)
+        "weekdayCount": weekday_day_count,
+    }
 
     # 1. 夜勤総量
     night_demand = sum(night_req_table)
@@ -476,29 +491,58 @@ def _preflight_diagnostics(active_nurses, night_req_table, weekday_day_staff,
             f"(夜勤可能{len(night_capable)}名 × 個人上限平均{night_capacity/max(len(night_capable),1):.1f})"
         )
 
-    # 2. 日勤総量（最低限）
-    day_demand = sum(
-        weekend_day_staff if d in weekends else weekday_day_staff
-        for d in range(num_days)
-    )
+    # 2. 日勤総量
+    day_demand = (weekday_day_count * weekday_day_staff +
+                  weekend_day_count * weekend_day_staff)
     day_capable = [n for n in active_nurses if not n.get("noDayShift", False)]
-    # 日勤の個人上限はないが、月内総セル数の物理上限から見積もる
-    day_capacity_max = len(day_capable) * num_days  # ゆるめの上限
-    if day_capacity_max < day_demand:
+    # 日勤の物理上限: 各ナースの 1ヶ月の最大勤務セル数 × 人数
+    # max_consec 制約から 1人あたり最大ワークセル数 ≈ ceil(num_days * mc / (mc+1))
+    per_nurse_max_work = (num_days * max_consec + max_consec) // (max_consec + 1)
+    day_capacity_strict = len(day_capable) * per_nurse_max_work
+    if day_capacity_strict < day_demand:
         warnings.append(
-            f"日勤総量不足: capacity_max={day_capacity_max} < demand={day_demand}"
+            f"日勤総量不足: capacity={day_capacity_strict} < demand={day_demand} "
+            f"(日勤可能{len(day_capable)}名 × 連続上限{max_consec}に基づく1人最大{per_nurse_max_work}日)"
         )
 
     # 3. 夜勤可能ナースが0
     if not night_capable:
         warnings.append("夜勤可能なナースがいません (全員 noNightShift=true)")
 
+    # 4. 日勤可能ナースが0
+    if not day_capable:
+        warnings.append("日勤可能なナースがいません (全員 noDayShift=true)")
+
+    # 5. 日勤要件が異常に低い (フロントの設定ミスを検出)
+    if weekday_day_staff <= 1 or weekend_day_staff <= 1:
+        warnings.append(
+            f"日勤必要人数が異常に低い: weekday={weekday_day_staff}, weekend={weekend_day_staff}"
+            f" — フロント設定値を確認してください"
+        )
+
+    # 6. weekends が num_days を超えている / 範囲外を含む
+    out_of_range = [d for d in weekends if not (0 <= d < num_days)]
+    if out_of_range:
+        warnings.append(
+            f"weekends に範囲外のインデックス {out_of_range[:5]}{'…' if len(out_of_range)>5 else ''} が含まれます"
+            f" (許容: 0〜{num_days-1})"
+        )
+
     return {
+        "parsedConfig": parsed_config,
         "nightDemand": night_demand,
         "nightCapacity": night_capacity,
         "nightCapableCount": len(night_capable),
         "dayDemand": day_demand,
+        "dayCapacity": day_capacity_strict,
         "dayCapableCount": len(day_capable),
+        "perDayDemandSample": [
+            {"day": d + 1,
+             "isWeekend": d in weekends,
+             "dayReq": weekend_day_staff if d in weekends else weekday_day_staff,
+             "nightReq": night_req_table[d]}
+            for d in list(range(min(7, num_days))) + list(range(max(0, num_days-3), num_days))
+        ],
         "warnings": warnings,
     }
 
@@ -627,7 +671,13 @@ def solve_schedule(request_data: dict) -> list[dict]:
     diagnostics = _preflight_diagnostics(
         active_nurses, night_req_table, weekday_day_staff, weekend_day_staff,
         weekends_combined, num_days, max_night,
+        max_consec=max_consec, max_days_off=max_days_off,
     )
+    _log(f"PREFLIGHT: parsedConfig={diagnostics['parsedConfig']}")
+    _log(f"PREFLIGHT: nightDemand={diagnostics['nightDemand']} "
+         f"nightCapacity={diagnostics['nightCapacity']} "
+         f"dayDemand={diagnostics['dayDemand']} "
+         f"dayCapacity={diagnostics['dayCapacity']}")
     if diagnostics["warnings"]:
         for w in diagnostics["warnings"]:
             _log(f"PREFLIGHT WARNING: {w}")
