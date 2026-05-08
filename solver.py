@@ -614,6 +614,15 @@ def solve_schedule(request_data: dict) -> list[dict]:
                     "error": f"解が見つかりませんでした (status={last_status})",
                     "solverStatus": last_status,
                     "validationErrors": chosen_errors[:10],
+                    # フロント描画が undefined で落ちないように 0 埋め
+                    "relaxLevel": -1,
+                    "nightBalance": 0,
+                    "dayShortage": 0,
+                    "nightShortage": 0,
+                    "consecViolations": 0,
+                    "requestMatch": 0,
+                    "avgDaysOff": 0,
+                    "nullCells": 0,
                 },
             })
             continue
