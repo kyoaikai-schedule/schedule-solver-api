@@ -1,8 +1,15 @@
 """OR-Tools CP-SAT nurse schedule solver — v3 (3-shift core + post-processing)."""
 
 from __future__ import annotations
+import sys
+import time
 from datetime import date
 from ortools.sat.python import cp_model
+
+
+def _log(msg: str) -> None:
+    """Cloud Run captures stdout/stderr → そのまま logs に流れる。"""
+    print(f"[solver] {msg}", file=sys.stderr, flush=True)
 
 # ──────────────────────────────────────
 # Solver-internal shift values (3 only)
@@ -454,6 +461,48 @@ def _post_process(solution_raw, active_nurses, forced_label, num_days):
     return output
 
 
+def _preflight_diagnostics(active_nurses, night_req_table, weekday_day_staff,
+                            weekend_day_staff, weekends, num_days, max_night_default):
+    """生成リクエストが数学的に成立し得るかを事前にチェックする。"""
+    warnings: list[str] = []
+
+    # 1. 夜勤総量
+    night_demand = sum(night_req_table)
+    night_capable = [n for n in active_nurses if not n.get("noNightShift", False)]
+    night_capacity = sum(n.get("maxNightShifts", max_night_default) for n in night_capable)
+    if night_capacity < night_demand:
+        warnings.append(
+            f"夜勤総量不足: capacity={night_capacity} < demand={night_demand} "
+            f"(夜勤可能{len(night_capable)}名 × 個人上限平均{night_capacity/max(len(night_capable),1):.1f})"
+        )
+
+    # 2. 日勤総量（最低限）
+    day_demand = sum(
+        weekend_day_staff if d in weekends else weekday_day_staff
+        for d in range(num_days)
+    )
+    day_capable = [n for n in active_nurses if not n.get("noDayShift", False)]
+    # 日勤の個人上限はないが、月内総セル数の物理上限から見積もる
+    day_capacity_max = len(day_capable) * num_days  # ゆるめの上限
+    if day_capacity_max < day_demand:
+        warnings.append(
+            f"日勤総量不足: capacity_max={day_capacity_max} < demand={day_demand}"
+        )
+
+    # 3. 夜勤可能ナースが0
+    if not night_capable:
+        warnings.append("夜勤可能なナースがいません (全員 noNightShift=true)")
+
+    return {
+        "nightDemand": night_demand,
+        "nightCapacity": night_capacity,
+        "nightCapableCount": len(night_capable),
+        "dayDemand": day_demand,
+        "dayCapableCount": len(day_capable),
+        "warnings": warnings,
+    }
+
+
 def _validate(data, params, relax_level=0):
     """構造エラーは常にチェック。人数要件は relax_level に応じて緩める。"""
     errors = []
@@ -574,46 +623,75 @@ def solve_schedule(request_data: dict) -> list[dict]:
         "night_ng_pairs": night_ng_pairs,
     }
 
+    # ── 事前 feasibility 診断 ──
+    diagnostics = _preflight_diagnostics(
+        active_nurses, night_req_table, weekday_day_staff, weekend_day_staff,
+        weekends_combined, num_days, max_night,
+    )
+    if diagnostics["warnings"]:
+        for w in diagnostics["warnings"]:
+            _log(f"PREFLIGHT WARNING: {w}")
+
     forbidden_solutions: list[dict] = []
     results: list[dict] = []
     pattern_labels = ["パターンA", "パターンB", "パターンC", "パターンD", "パターンE"]
 
     for pat_idx in range(num_patterns):
         label = pattern_labels[pat_idx] if pat_idx < len(pattern_labels) else f"パターン{pat_idx + 1}"
+        _log(f"=== {label} 開始 (pat_idx={pat_idx}) ===")
 
         chosen = None
         chosen_errors: list[str] = []
         last_status = None
+        attempts: list[dict] = []  # 各 relax_level の試行記録
 
         # 試行: relax 0(完全遵守) → 1(日勤緩和) → 2(日勤・夜勤緩和)
         for relax_level in (0, 1, 2):
+            t0 = time.time()
             res = _solve_one_pattern(params, forbidden_solutions, relax_level=relax_level)
+            elapsed = time.time() - t0
             last_status = res["status"]
+            attempts.append({
+                "relaxLevel": relax_level,
+                "status": last_status,
+                "elapsedSec": round(elapsed, 2),
+            })
+            _log(f"  {label} relax={relax_level}: status={last_status} elapsed={elapsed:.2f}s")
+
             if res["raw"] is None:
                 continue  # この緩和では解なし、次の緩和へ
             final_data = _post_process(res["raw"], active_nurses, forced_label, num_days)
             errors = _validate(final_data, params, relax_level=relax_level)
             if not errors:
+                attempts[-1]["validationErrors"] = 0
                 chosen = {
                     "raw": res["raw"],
                     "data": final_data,
                     "objective": res["objective"],
                     "relax_level": relax_level,
                 }
+                _log(f"  {label} relax={relax_level}: 採用")
                 break
+            attempts[-1]["validationErrors"] = len(errors)
+            _log(f"  {label} relax={relax_level}: validation NG ({len(errors)}件) → 次の緩和へ")
             chosen_errors = errors
-            # validation失敗 → 次の緩和レベルへ
 
         if chosen is None:
+            err_msg = f"解が見つかりませんでした (status={last_status})"
+            if diagnostics["warnings"]:
+                err_msg += " — " + "; ".join(diagnostics["warnings"][:2])
+            _log(f"!!! {label} 全 relax_level で失敗: {err_msg}")
             results.append({
                 "label": label,
                 "data": {},
                 "score": 0,
                 "metrics": {
                     "solverUsed": True,
-                    "error": f"解が見つかりませんでした (status={last_status})",
+                    "error": err_msg,
                     "solverStatus": last_status,
                     "validationErrors": chosen_errors[:10],
+                    "attempts": attempts,
+                    "diagnostics": diagnostics,
                     # フロント描画が undefined で落ちないように 0 埋め
                     "relaxLevel": -1,
                     "nightBalance": 0,
@@ -692,6 +770,8 @@ def solve_schedule(request_data: dict) -> list[dict]:
                 "requestMatch": round(req_match, 1),
                 "avgDaysOff": round(avg_off, 1),
                 "nullCells": null_cells,
+                "attempts": attempts,
+                "diagnostics": diagnostics,
             },
         })
 
