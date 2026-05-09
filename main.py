@@ -42,20 +42,22 @@ def test_solver():
     新solver仕様の検証:
       - 自動生成セル(=希望なし)に 管夜・管明・有 が出ない
       - 夜→明→休 / 管夜→管明→休 が100%守られる
-      - 各日の夜勤人数 == nightShiftPattern (最終日のみ 0)
+      - 各日の夜勤人数 == nightShiftPattern (月末日も通常通り)
       - 各日の日勤人数 >= weekday/weekendDayStaff
       - 連続勤務上限を超えない
       - 空白セルなし
     """
 
     num_days = 31
+    # 月末も夜勤を割り当てるため、24名(うち4名 noNightShift)では夜勤総量が
+    # 不足する。26名(うち4名 noNightShift = 22名夜勤可能)でテスト。
     nurses = [
         {
             "id": i, "name": f"看護師{i}", "position": "一般",
-            "noNightShift": i > 20, "noDayShift": False,
+            "noNightShift": i > 22, "noDayShift": False,
             "maxNightShifts": 6, "excludeFromGeneration": False,
         }
-        for i in range(1, 25)
+        for i in range(1, 27)
     ]
     config = {
         "weekdayDayStaff": 10,
@@ -148,9 +150,7 @@ def test_solver():
         if max_consec_found > config["maxConsecutiveDays"]:
             errors.append(f"Nurse {nid}: 連続勤務{max_consec_found}日 (上限{config['maxConsecutiveDays']})")
 
-        # 月末夜勤 (最終日のみ禁止)
-        if shifts[-1] in ("夜", "管夜"):
-            errors.append(f"Nurse {nid}: 最終日に夜勤")
+        # 月末日の夜勤も通常通り許可（明/休は翌月へ申し送り）
 
     # 2. 日次 staffing チェック (ハード制約と同じ条件)
     daily_summary = []
@@ -159,10 +159,9 @@ def test_solver():
         kan_night_count = sum(1 for shifts in data.values() if shifts[d] == "管夜")
         day_count = sum(1 for shifts in data.values() if shifts[d] == "日")
 
-        # 最終日のみ夜勤禁止(=0)。それ以外は pattern=[4,4] で 4固定。
-        expected_night = 0 if d == num_days - 1 else 4
-        if night_count != expected_night:
-            errors.append(f"Day {d+1}: 夜勤人数 {night_count} ≠ {expected_night}")
+        # nightShiftPattern=[4,4] なので全日 4 固定（月末日も通常通り夜勤を割当）
+        if night_count != 4:
+            errors.append(f"Day {d+1}: 夜勤人数 {night_count} ≠ 4")
 
         req_day = config["weekendDayStaff"] if d in weekend_set else config["weekdayDayStaff"]
         if day_count < req_day:

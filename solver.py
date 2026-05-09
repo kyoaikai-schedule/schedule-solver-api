@@ -203,11 +203,9 @@ def _solve_one_pattern(params, forbidden_solutions, relax_level=0):
                 is_night[(n, d + 4)].negated(),
             ])
 
-    # ── 月末夜勤禁止 - 最終日のみ（明は最終日翌＝月外OK、休はその次＝月外OK）──
-    for n in N:
-        d = num_days - 1
-        if 0 <= d < num_days and forced_shift.get((n, d)) != NIGHT:
-            model.add(is_night[(n, d)] == 0)
+    # 月末日の夜勤も通常通り許可。明は翌月初日、休は翌月2日目への申し送り
+    # (post-proc では月内の明/休のみ生成、翌月分はフロントが prev_month_constraints
+    #  として次月生成時に渡す前提)
 
     # ── 連続勤務制限 ──
     for n in N:
@@ -463,7 +461,8 @@ def _post_process(solution_raw, active_nurses, forced_label, num_days):
 
 def _preflight_diagnostics(active_nurses, night_req_table, weekday_day_staff,
                             weekend_day_staff, weekends, num_days, max_night_default,
-                            max_consec=3, max_days_off=10):
+                            max_consec=3, max_days_off=10,
+                            prev_month=None, requests=None):
     """生成リクエストが数学的に成立し得るかを事前にチェックする。"""
     warnings: list[str] = []
 
@@ -528,6 +527,31 @@ def _preflight_diagnostics(active_nurses, night_req_table, weekday_day_staff,
             f" (許容: 0〜{num_days-1})"
         )
 
+    # 7. prev_month_constraints の orphan ID 検出
+    nurse_ids = {str(n["id"]) for n in active_nurses}
+    orphan_prev_ids: list[str] = []
+    if prev_month:
+        prev_keys = {str(k) for k in prev_month.keys()}
+        orphan_prev_ids = sorted(prev_keys - nurse_ids)
+        if orphan_prev_ids:
+            warnings.append(
+                f"prevMonthConstraints に存在しないナースID: "
+                f"{orphan_prev_ids[:5]}{'…' if len(orphan_prev_ids)>5 else ''} "
+                f"({len(orphan_prev_ids)}件) — ソルバーは無視して進めます"
+            )
+
+    # 8. requests の orphan ID 検出
+    orphan_req_ids: list[str] = []
+    if requests:
+        req_keys = {str(k) for k in requests.keys()}
+        orphan_req_ids = sorted(req_keys - nurse_ids)
+        if orphan_req_ids:
+            warnings.append(
+                f"requests に存在しないナースID: "
+                f"{orphan_req_ids[:5]}{'…' if len(orphan_req_ids)>5 else ''} "
+                f"({len(orphan_req_ids)}件) — ソルバーは無視して進めます"
+            )
+
     return {
         "parsedConfig": parsed_config,
         "nightDemand": night_demand,
@@ -536,6 +560,8 @@ def _preflight_diagnostics(active_nurses, night_req_table, weekday_day_staff,
         "dayDemand": day_demand,
         "dayCapacity": day_capacity_strict,
         "dayCapableCount": len(day_capable),
+        "orphanPrevIds": orphan_prev_ids,
+        "orphanRequestIds": orphan_req_ids,
         "perDayDemandSample": [
             {"day": d + 1,
              "isWeekend": d in weekends,
@@ -642,10 +668,7 @@ def solve_schedule(request_data: dict) -> list[dict]:
         year, month, num_days, night_pattern,
         start_with_three=config.get("startWithThree", False),
     )
-    # 月末最終日のみ夜勤禁止 → 必要人数も0で整合させる
-    if 0 <= num_days - 1 < len(night_req_table):
-        night_req_table[num_days - 1] = 0
-
+    # 月末日も nightShiftPattern を適用（明/休は翌月へのキャリーオーバー）
     forced_shift, forced_label = _build_forced(active_nurses, requests, prev_month, num_days)
 
     weekends_combined = weekends | holidays
@@ -672,6 +695,7 @@ def solve_schedule(request_data: dict) -> list[dict]:
         active_nurses, night_req_table, weekday_day_staff, weekend_day_staff,
         weekends_combined, num_days, max_night,
         max_consec=max_consec, max_days_off=max_days_off,
+        prev_month=prev_month, requests=requests,
     )
     _log(f"PREFLIGHT: parsedConfig={diagnostics['parsedConfig']}")
     _log(f"PREFLIGHT: nightDemand={diagnostics['nightDemand']} "
