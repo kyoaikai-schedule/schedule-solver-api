@@ -654,6 +654,102 @@ def _post_process(solution_raw, active_nurses, forced_label, num_days):
     return output
 
 
+def _detect_suspicious_chains(active_nurses, requests, prev_month, num_days):
+    """個別ナース内の "怪しい" 連続パターンを抽出。
+
+    厳格 chain (夜→明→休) ルール下で実質的に矛盾するパターン:
+      - day N 夜 → day N+2 明 (夜→明→明 の構造、休であるべき)
+      - day N 夜 → day N+2 夜 (2連夜勤, 不可)
+      - day N 明 → day N+1 夜 (連続 night chain の起点違反)
+      - day N 明 → day N+1 明 (前日のチェーンが重なる)
+      - day N 管夜 → day N+1 夜/日 等 (forced auto-fill 衝突)
+
+    また月末日に「明」希望 → 翌月初日への "休" 申し送りが必要 (注意喚起のみ)
+    """
+    suspicious: list = []
+    month_end_ake: list = []
+
+    for n in active_nurses:
+        nid = str(n["id"])
+        nurse_reqs = requests.get(nid, {}) if isinstance(requests, dict) else {}
+        nurse_prev = prev_month.get(nid, {}) if isinstance(prev_month, dict) else {}
+
+        # Merge into a per-day map (request takes precedence over prev_month)
+        locked: dict = {}
+        for src_name, src in (("prev_month", nurse_prev), ("request", nurse_reqs)):
+            if not isinstance(src, dict):
+                continue
+            for k, v in src.items():
+                if str(k).startswith("_"):
+                    continue
+                try:
+                    d = int(k) - 1
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= d < num_days:
+                    locked[d] = {"label": v, "source": src_name}
+
+        sorted_days = sorted(locked.keys())
+        for d in sorted_days:
+            lbl = locked[d]["label"]
+            src = locked[d]["source"]
+
+            # 夜 → d+2 が明/夜 (2連夜勤起こす形) は厳格 chain で違反
+            if lbl == "夜" and d + 2 < num_days and (d + 2) in locked:
+                nxt2 = locked[d + 2]["label"]
+                if nxt2 == "夜":
+                    suspicious.append({
+                        "nurseId": nid,
+                        "name": n.get("name", ""),
+                        "pattern": f"day{d+1}=夜 → day{d+3}=夜",
+                        "type": "double_night",
+                        "message": (
+                            f"2連夜勤 (夜明夜) はソルバー上不可: 夜→翌々日OFF が強制されるため。"
+                            f" day{d+3}を休に変更するか day{d+1} の夜希望を削除してください"
+                        ),
+                    })
+                elif nxt2 == "明":
+                    suspicious.append({
+                        "nurseId": nid,
+                        "name": n.get("name", ""),
+                        "pattern": f"day{d+1}=夜 → day{d+3}=明",
+                        "type": "night_then_d2_ake",
+                        "message": (
+                            f"day{d+1}=夜なら day{d+3}は休のはず。明希望にすると前日が夜である必要があるが、"
+                            f"day{d+2}は明 (= 夜の翌日) なので両立不可"
+                        ),
+                    })
+
+            # 明 → d+1 が夜 は 2連夜勤を意味し strict chain で不可
+            if lbl == "明" and d + 1 < num_days and (d + 1) in locked:
+                nxt = locked[d + 1]["label"]
+                if nxt == "夜":
+                    suspicious.append({
+                        "nurseId": nid,
+                        "name": n.get("name", ""),
+                        "pattern": f"day{d+1}=明 → day{d+2}=夜",
+                        "type": "ake_then_night",
+                        "message": (
+                            f"明の翌日に夜は配置できない (= 2連夜勤の起点)。"
+                            f" day{d+2}を休/有 に変更してください"
+                        ),
+                    })
+
+            # 月末日が 明 → 翌月初日への 休 が必要 (注意喚起)
+            if lbl == "明" and d == num_days - 1:
+                month_end_ake.append({
+                    "nurseId": nid,
+                    "name": n.get("name", ""),
+                    "day": d + 1,
+                    "message": (
+                        "月末日が明希望: 翌月初日が休になることをフロント側で確認してください"
+                        " (当月のソルバーでは制約できません)"
+                    ),
+                })
+
+    return suspicious, month_end_ake
+
+
 def _detect_forced_conflicts(active_nurses, requests, prev_month, num_days):
     """forced cells (希望 + prev_month) の chain 整合性を検証。
 
@@ -727,9 +823,9 @@ def _detect_forced_conflicts(active_nurses, requests, prev_month, num_days):
             lbl = locked[d]["label"]
             src = locked[d]["source"]
 
-            # Case A/B: 夜希望
+            # Case A/B: 夜希望 (現在のソルバーは strict chain: 夜→明→休 を強制)
             if lbl == "夜":
-                # day d+1: must be 明/休/有 (or unforced)
+                # day d+1: 明/休/有 のみ (= OFF)。日/夜/管夜/管明 は不可
                 if d + 1 < num_days and (d + 1) in locked:
                     nxt = locked[d + 1]["label"]
                     if nxt not in ("明", "休", "有"):
@@ -743,10 +839,10 @@ def _detect_forced_conflicts(active_nurses, requests, prev_month, num_days):
                                 f" 明/休/有 のいずれかであるべき"
                             ),
                         })
-                # day d+2: must be 休/有/夜/明 (2連夜勤の余地)
+                # day d+2: 休/有/明 のみ (= OFF)。夜 は 2連夜勤になるため不可。日 も不可
                 if d + 2 < num_days and (d + 2) in locked:
                     nxt2 = locked[d + 2]["label"]
-                    if nxt2 not in ("休", "有", "夜", "明"):
+                    if nxt2 not in ("休", "有", "明"):
                         conflicts.append({
                             "nurseId": nid,
                             "name": n.get("name", ""),
@@ -754,7 +850,7 @@ def _detect_forced_conflicts(active_nurses, requests, prev_month, num_days):
                             "type": "night_then_invalid_d2",
                             "message": (
                                 f"day{d+1}=夜({src}) → day{d+3}={nxt2}({locked[d+2]['source']}) 固定。"
-                                f" 休/有/夜/明 のいずれかであるべき"
+                                f" 休/有/明 のいずれかであるべき (2連夜勤=夜明夜は不可)"
                             ),
                         })
 
@@ -790,16 +886,19 @@ def _detect_forced_conflicts(active_nurses, requests, prev_month, num_days):
                                 "type": "ake_no_prev_night",
                                 "message": f"day{d+1}=明({src}) だが前日 day{d}={prv}({locked[d-1]['source']}) 固定。夜であるべき",
                             })
-                # 明 の翌日も 休/有/夜
+                # 明 の翌日: 休/有 (strict chain) のみ。夜 は 2連夜勤になるため不可
                 if d + 1 < num_days and (d + 1) in locked:
                     nxt = locked[d + 1]["label"]
-                    if nxt not in ("休", "有", "夜"):
+                    if nxt not in ("休", "有"):
                         conflicts.append({
                             "nurseId": nid,
                             "name": n.get("name", ""),
                             "day": d + 1,
                             "type": "ake_then_invalid",
-                            "message": f"day{d+1}=明({src}) → day{d+2}={nxt}({locked[d+1]['source']}) 固定。休/有/夜であるべき",
+                            "message": (
+                                f"day{d+1}=明({src}) → day{d+2}={nxt}({locked[d+1]['source']}) 固定。"
+                                f" 休/有 のいずれかであるべき (明→夜 の 2連夜勤は不可)"
+                            ),
                         })
 
             # Case E: 管明希望 → 前日は 管夜 のはず
@@ -888,16 +987,22 @@ def _request_distribution(requests, active_nurses, num_days, weekday_day_staff,
                            weekend_day_staff, weekends, night_req_table):
     """希望休/夜勤の日別分布。要件を満たせる人数が残るかチェック。"""
     if not isinstance(requests, dict):
-        return {"totalRequests": 0, "perDayMaxRequests": [], "daysWithExcessiveRequests": []}
+        return {
+            "totalRequests": 0,
+            "perDayMaxRequests": [],
+            "daysWithExcessiveRequests": [],
+            "dailyRequestSummary": [],
+        }
 
     nurse_id_set = {str(n["id"]) for n in active_nurses}
-    night_capable = sum(1 for n in active_nurses if not n.get("noNightShift", False))
-    day_capable = sum(1 for n in active_nurses if not n.get("noDayShift", False))
     total_active = len(active_nurses)
 
-    per_day_off = [0] * num_days
-    per_day_night_req_user = [0] * num_days
-    per_day_day_req_user = [0] * num_days
+    per_day_off = [0] * num_days       # 休/有 のみ (純粋な休み希望)
+    per_day_ake = [0] * num_days       # 明
+    per_day_kanake = [0] * num_days    # 管明
+    per_day_night = [0] * num_days     # 夜
+    per_day_kannight = [0] * num_days  # 管夜
+    per_day_day = [0] * num_days       # 日
     total_requests = 0
 
     for nid, req_map in requests.items():
@@ -911,12 +1016,18 @@ def _request_distribution(requests, active_nurses, num_days, weekday_day_staff,
             if not (0 <= d < num_days):
                 continue
             total_requests += 1
-            if label in ("休", "有", "明", "管明"):
+            if label in ("休", "有"):
                 per_day_off[d] += 1
-            elif label in ("夜", "管夜"):
-                per_day_night_req_user[d] += 1
+            elif label == "明":
+                per_day_ake[d] += 1
+            elif label == "管明":
+                per_day_kanake[d] += 1
+            elif label == "夜":
+                per_day_night[d] += 1
+            elif label == "管夜":
+                per_day_kannight[d] += 1
             elif label == "日":
-                per_day_day_req_user[d] += 1
+                per_day_day[d] += 1
 
     # 希望が多い日 (上位5件)
     sorted_days = sorted(
@@ -927,27 +1038,59 @@ def _request_distribution(requests, active_nurses, num_days, weekday_day_staff,
 
     # 希望休が多すぎて要件を満たせない日を検出
     excessive: list = []
+    daily_summary: list = []
     for d in range(num_days):
         off_req = per_day_off[d]
+        ake_req = per_day_ake[d]
+        kanake_req = per_day_kanake[d]
+        night_req_user = per_day_night[d]
+        kannight_req = per_day_kannight[d]
+        day_req_user = per_day_day[d]
         night_req = night_req_table[d]
         day_req = weekend_day_staff if d in weekends else weekday_day_staff
+
         # この日に勤務可能 (forced 休以外) なナース数
-        feasible_workers = total_active - off_req
+        # 明・管明 も勤務にはカウントされないので除外
+        forced_off_total = off_req + ake_req + kanake_req
+        feasible_workers = total_active - forced_off_total
         needed = night_req + day_req
+
+        issues: list[str] = []
         if feasible_workers < needed:
+            issues.append(f"勤務可能{feasible_workers}<必要{needed}")
             excessive.append({
                 "day": d + 1,
                 "offRequests": off_req,
+                "akeRequests": ake_req,
+                "kanakeRequests": kanake_req,
                 "nightReq": night_req,
                 "dayReq": day_req,
                 "neededWorkers": needed,
                 "feasibleWorkers": feasible_workers,
                 "shortfall": needed - feasible_workers,
             })
+        if night_req_user > night_req:
+            issues.append(f"夜希望{night_req_user}>必要{night_req}")
+        if day_req_user + night_req_user + off_req + ake_req + kanake_req + kannight_req > 0:
+            daily_summary.append({
+                "day": d + 1,
+                "isWeekend": d in weekends,
+                "off": off_req,
+                "ake": ake_req,
+                "kanake": kanake_req,
+                "night": night_req_user,
+                "kannight": kannight_req,
+                "dayShift": day_req_user,
+                "nightReq": night_req,
+                "dayReq": day_req,
+                "feasibleWorkers": feasible_workers,
+                "issues": issues,
+            })
 
     return {
         "totalRequests": total_requests,
         "perDayMaxRequests": per_day_max_requests,
+        "dailyRequestSummary": daily_summary,
         "daysWithExcessiveRequests": excessive,
     }
 
@@ -1076,6 +1219,36 @@ def _preflight_diagnostics(active_nurses, night_req_table, weekday_day_staff,
             f"{' …' if len(forced_conflicts) > 3 else ''} (詳細: forcedCellConflicts)"
         )
 
+    # 怪しい連続パターン (個人内) と月末日 明
+    suspicious_chains, month_end_ake = _detect_suspicious_chains(
+        active_nurses, requests or {}, prev_month or {}, num_days
+    )
+    if suspicious_chains:
+        sample = suspicious_chains[:3]
+        msg = "; ".join(f"{c['name']} {c['pattern']}" for c in sample)
+        warnings.append(
+            f"怪しい連続希望 {len(suspicious_chains)} 件: {msg}"
+            f"{' …' if len(suspicious_chains) > 3 else ''} (詳細: suspiciousChainRequests)"
+        )
+    if month_end_ake:
+        names = ", ".join(x["name"] for x in month_end_ake[:3])
+        warnings.append(
+            f"月末日が明希望のナース {len(month_end_ake)}名: {names}"
+            f" — 翌月初日の休がフロントで適切に申し送られているか確認 (詳細: monthEndAke)"
+        )
+
+    # chain rule の明文化 (フロントに現在のルールを伝える)
+    chain_rule = {
+        "夜→翌日": "OFF (= 明/休/有 のいずれか)。ハード制約",
+        "夜→翌々日": "OFF (= 明/休/有 のいずれか)。ハード制約。2連夜勤(夜明夜)は不可",
+        "明→翌日": "休/有 (validator)。明→夜 は 2連夜勤になるため不可",
+        "管夜→翌日": "管明 (forced auto-fill)",
+        "管夜→翌々日": "休 (forced auto-fill)",
+        "管明→翌日": "休/有 (validator)",
+        "連続勤務カウント": "夜・日 は working、明・管明・休・有 は non-working",
+        "月末": "月末日も nightShiftPattern を適用。明/休 は翌月へキャリーオーバー",
+    }
+
     return {
         "parsedConfig": parsed_config,
         "nightDemand": night_demand,
@@ -1091,6 +1264,9 @@ def _preflight_diagnostics(active_nurses, night_req_table, weekday_day_staff,
         "individualNurseSummary": nurse_summary,
         "requestStats": request_dist,
         "forcedCellConflicts": forced_conflicts,
+        "suspiciousChainRequests": suspicious_chains,
+        "monthEndAke": month_end_ake,
+        "chainRule": chain_rule,
         "perNurseLockedDays": per_nurse_locked,
         "perNurseLockedDaysConflictOnly": per_nurse_locked_conflict,
         "perDayDemandSample": [
