@@ -128,6 +128,201 @@ def _build_forced(active_nurses, requests, prev_month, num_days):
 
 
 # ──────────────────────────────────────
+# Infeasibility 解析: 制約グループに assumption literal を付け、
+# UNSAT core (SufficientAssumptionsForInfeasibility) を抽出
+# ──────────────────────────────────────
+def _diagnose_infeasible(params):
+    """各制約グループに assumption を付与して INFEASIBLE の主因を特定する。
+
+    通常 solve よりずっと小さなモデル: 緩和 level 2 と同じ条件で
+    assumption-conditional に組み立てる。返り値は活発な
+    制約グループ名のリスト (UNSAT に効いた制約)。"""
+    active_nurses = params["active_nurses"]
+    num_days = params["num_days"]
+    night_req_table = params["night_req_table"]
+    weekday_day_staff = params["weekday_day_staff"]
+    weekend_day_staff = params["weekend_day_staff"]
+    weekends = params["weekends"]
+    max_consec = params["max_consec"]
+    max_night = params["max_night"]
+    forced_shift = params["forced_shift"]
+    forced_label = params["forced_label"]
+    prev_month = params["prev_month"]
+    night_ng_pairs = params["night_ng_pairs"]
+
+    num_nurses = len(active_nurses)
+    if num_nurses == 0 or num_days == 0:
+        return {"sufficientAssumptions": [], "note": "no nurses or zero days"}
+
+    N = range(num_nurses)
+    D = range(num_days)
+    model = cp_model.CpModel()
+    shifts = {}
+    is_day = {}
+    is_night = {}
+    is_off = {}
+    is_working = {}
+
+    for n in N:
+        for d in D:
+            shifts[(n, d)] = model.new_int_var(1, 3, f"s_{n}_{d}")
+            is_day[(n, d)] = model.new_bool_var(f"id_{n}_{d}")
+            is_night[(n, d)] = model.new_bool_var(f"in_{n}_{d}")
+            is_off[(n, d)] = model.new_bool_var(f"io_{n}_{d}")
+            is_working[(n, d)] = model.new_bool_var(f"iw_{n}_{d}")
+            model.add(shifts[(n, d)] == DAY).only_enforce_if(is_day[(n, d)])
+            model.add(shifts[(n, d)] != DAY).only_enforce_if(is_day[(n, d)].negated())
+            model.add(shifts[(n, d)] == NIGHT).only_enforce_if(is_night[(n, d)])
+            model.add(shifts[(n, d)] != NIGHT).only_enforce_if(is_night[(n, d)].negated())
+            model.add(shifts[(n, d)] == OFF).only_enforce_if(is_off[(n, d)])
+            model.add(shifts[(n, d)] != OFF).only_enforce_if(is_off[(n, d)].negated())
+            model.add(is_day[(n, d)] + is_night[(n, d)] + is_off[(n, d)] == 1)
+            model.add(is_working[(n, d)] == 1 - is_off[(n, d)])
+
+    # 各制約グループ用 assumption literal
+    # (Trueに固定したいので、各グループのenforceに使う)
+    assumptions: dict[str, cp_model.IntVar] = {}
+
+    def make_assumption(name: str):
+        a = model.new_bool_var(f"a_{name}")
+        assumptions[name] = a
+        return a
+
+    # ── A. NIGHT→OFF / NIGHT→OFF (翌々日も) ──
+    a_chain = make_assumption("nightChain")
+    for n in N:
+        for d in D:
+            if d + 1 < num_days:
+                # is_night→is_off@d+1, conditional on a_chain
+                # ⇔ NOT a_chain OR NOT is_night OR is_off
+                model.add_bool_or([a_chain.negated(), is_night[(n, d)].negated(), is_off[(n, d + 1)]])
+            if d + 2 < num_days:
+                model.add_bool_or([a_chain.negated(), is_night[(n, d)].negated(), is_off[(n, d + 2)]])
+
+    # ── B. 3連夜勤禁止 ──
+    a_no_triple = make_assumption("noTripleNight")
+    for n in N:
+        for d in range(num_days - 4):
+            model.add_bool_or([
+                a_no_triple.negated(),
+                is_night[(n, d)].negated(),
+                is_night[(n, d + 2)].negated(),
+                is_night[(n, d + 4)].negated(),
+            ])
+
+    # ── C. 連続勤務 ──
+    a_consec = make_assumption("maxConsec")
+    window = max_consec + 1
+    for n in N:
+        for d in D:
+            if d + window <= num_days:
+                # sum(is_working[d..d+window-1]) ≤ max_consec, conditional on a_consec
+                # ⇔ if a_consec then sum ≤ max_consec
+                model.add(sum(is_working[(n, d + k)] for k in range(window)) <= max_consec).only_enforce_if(a_consec)
+
+    # ── D. 前月引継ぎ連続勤務 ──
+    a_prev_consec = make_assumption("prevConsec")
+    for n in N:
+        nurse = active_nurses[n]
+        nid = str(nurse["id"])
+        prev_consec = prev_month.get(nid, {}).get("_consecDays", 0) if isinstance(prev_month, dict) else 0
+        if prev_consec > 0:
+            remaining = max_consec - prev_consec
+            if remaining <= 0:
+                if 0 < num_days:
+                    model.add(is_working[(n, 0)] == 0).only_enforce_if(a_prev_consec)
+            else:
+                limit = min(remaining + 1, num_days)
+                if limit > 0:
+                    model.add(sum(is_working[(n, k)] for k in range(limit)) <= remaining).only_enforce_if(a_prev_consec)
+
+    # ── E. 個別 noNightShift / noDayShift ──
+    a_no_night_pref = make_assumption("noNightPref")
+    a_no_day_pref = make_assumption("noDayPref")
+    for n in N:
+        nurse = active_nurses[n]
+        if nurse.get("noNightShift", False):
+            for d in D:
+                if forced_shift.get((n, d)) != NIGHT:
+                    model.add(is_night[(n, d)] == 0).only_enforce_if(a_no_night_pref)
+        if nurse.get("noDayShift", False):
+            for d in D:
+                if forced_shift.get((n, d)) != DAY:
+                    model.add(is_day[(n, d)] == 0).only_enforce_if(a_no_day_pref)
+
+    # ── F. 個別 maxNightShifts ──
+    a_max_night = make_assumption("maxNightShifts")
+    for n in N:
+        nurse = active_nurses[n]
+        nurse_max_night = nurse.get("maxNightShifts", max_night)
+        terms = [is_night[(n, d)] for d in D if forced_label.get((n, d)) != "管夜"]
+        if terms:
+            model.add(sum(terms) <= nurse_max_night).only_enforce_if(a_max_night)
+
+    # ── G. 夜勤 NG ペア ──
+    a_ng_pair = make_assumption("nightNgPairs")
+    for pair in night_ng_pairs:
+        if len(pair) < 2:
+            continue
+        idx_a = next((i for i, nn in enumerate(active_nurses) if nn["id"] == pair[0]), None)
+        idx_b = next((i for i, nn in enumerate(active_nurses) if nn["id"] == pair[1]), None)
+        if idx_a is not None and idx_b is not None:
+            for d in D:
+                model.add_bool_or([a_ng_pair.negated(), is_night[(idx_a, d)].negated(), is_night[(idx_b, d)].negated()])
+
+    # ── H. forced cells (希望/前月) ──
+    a_forced = make_assumption("forcedCells")
+    for (n, d), val in forced_shift.items():
+        model.add(shifts[(n, d)] == val).only_enforce_if(a_forced)
+
+    # ── I. forced 休/有 前日 NIGHT 禁止 ──
+    a_off_prev_no_night = make_assumption("offPrevNoNight")
+    for (n, d), lbl in forced_label.items():
+        if lbl in ("休", "有") and d > 0 and (n, d - 1) not in forced_shift:
+            model.add(is_night[(n, d - 1)] == 0).only_enforce_if(a_off_prev_no_night)
+
+    # ── J. 夜勤人数 (緩和: ±1 許容) ──
+    a_night_staff = make_assumption("nightStaff")
+    for d in D:
+        required = night_req_table[d]
+        terms = [is_night[(n, d)] for n in N if forced_label.get((n, d)) != "管夜"]
+        if not terms:
+            continue
+        total = sum(terms)
+        model.add(total >= max(0, required - 1)).only_enforce_if(a_night_staff)
+        model.add(total <= required + 1).only_enforce_if(a_night_staff)
+
+    # ── K. 日勤人数 (緩和: -1 許容) ──
+    a_day_staff = make_assumption("dayStaff")
+    for d in D:
+        required = weekend_day_staff if d in weekends else weekday_day_staff
+        total_day = sum(is_day[(n, d)] for n in N)
+        model.add(total_day >= max(0, required - 1)).only_enforce_if(a_day_staff)
+
+    # assumption をモデルに登録して solve
+    model.add_assumptions(list(assumptions.values()))
+
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = 8
+    solver.parameters.num_workers = 4
+
+    status = solver.solve(model)
+
+    if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
+        return {"sufficientAssumptions": [], "note": "feasible under all assumptions (UNSAT analysis not applicable)"}
+    if status != cp_model.INFEASIBLE:
+        return {"sufficientAssumptions": [], "note": f"diagnostic solve status={solver.status_name(status)}"}
+
+    sufficient_indices = solver.sufficient_assumptions_for_infeasibility()
+    name_by_idx = {a.index: name for name, a in assumptions.items()}
+    sufficient_names = [name_by_idx.get(idx, f"unknown_{idx}") for idx in sufficient_indices]
+    return {
+        "sufficientAssumptions": sufficient_names,
+        "note": "UNSAT core: removing ALL of these (= relaxing those constraint groups) would make problem feasible",
+    }
+
+
+# ──────────────────────────────────────
 # Solver core
 # ──────────────────────────────────────
 def _solve_one_pattern(params, forbidden_solutions, relax_level=0):
@@ -459,6 +654,125 @@ def _post_process(solution_raw, active_nurses, forced_label, num_days):
     return output
 
 
+def _per_nurse_summary(active_nurses, max_night_default, requests, prev_month):
+    """個別ナースのケイパビリティと希望サマリ。INFEASIBLE 解析の手がかり用。"""
+    summary = []
+    position_stats: dict = {}
+    max_buckets: dict = {}
+
+    for n in active_nurses:
+        nid = str(n["id"])
+        no_night = bool(n.get("noNightShift", False))
+        no_day = bool(n.get("noDayShift", False))
+        max_night = n.get("maxNightShifts", max_night_default)
+        position = n.get("position", "未設定")
+
+        nurse_reqs = requests.get(nid, {}) if isinstance(requests, dict) else {}
+        prev_reqs = prev_month.get(nid, {}) if isinstance(prev_month, dict) else {}
+        request_off_count = sum(1 for v in nurse_reqs.values() if v in ("休", "有"))
+        request_night_count = sum(1 for v in nurse_reqs.values() if v in ("夜", "管夜"))
+        prev_consec = prev_reqs.get("_consecDays", 0) if isinstance(prev_reqs, dict) else 0
+        prev_locked = sum(1 for k in prev_reqs.keys() if not str(k).startswith("_")) \
+                      if isinstance(prev_reqs, dict) else 0
+
+        summary.append({
+            "id": n["id"],
+            "name": n.get("name", ""),
+            "position": position,
+            "noNightShift": no_night,
+            "noDayShift": no_day,
+            "maxNightShifts": max_night,
+            "requestsOff": request_off_count,
+            "requestsNight": request_night_count,
+            "prevConsecDays": prev_consec,
+            "prevLockedCells": prev_locked,
+        })
+
+        if position not in position_stats:
+            position_stats[position] = {"count": 0, "nightCapable": 0,
+                                         "dayCapable": 0, "totalMaxNights": 0}
+        ps = position_stats[position]
+        ps["count"] += 1
+        if not no_night:
+            ps["nightCapable"] += 1
+            ps["totalMaxNights"] += max_night
+        if not no_day:
+            ps["dayCapable"] += 1
+
+        bucket_key = f"max={max_night}" if not no_night else "noNight"
+        max_buckets[bucket_key] = max_buckets.get(bucket_key, 0) + 1
+
+    return summary, position_stats, max_buckets
+
+
+def _request_distribution(requests, active_nurses, num_days, weekday_day_staff,
+                           weekend_day_staff, weekends, night_req_table):
+    """希望休/夜勤の日別分布。要件を満たせる人数が残るかチェック。"""
+    if not isinstance(requests, dict):
+        return {"totalRequests": 0, "perDayMaxRequests": [], "daysWithExcessiveRequests": []}
+
+    nurse_id_set = {str(n["id"]) for n in active_nurses}
+    night_capable = sum(1 for n in active_nurses if not n.get("noNightShift", False))
+    day_capable = sum(1 for n in active_nurses if not n.get("noDayShift", False))
+    total_active = len(active_nurses)
+
+    per_day_off = [0] * num_days
+    per_day_night_req_user = [0] * num_days
+    per_day_day_req_user = [0] * num_days
+    total_requests = 0
+
+    for nid, req_map in requests.items():
+        if str(nid) not in nurse_id_set or not isinstance(req_map, dict):
+            continue
+        for day_str, label in req_map.items():
+            try:
+                d = int(day_str) - 1
+            except (TypeError, ValueError):
+                continue
+            if not (0 <= d < num_days):
+                continue
+            total_requests += 1
+            if label in ("休", "有", "明", "管明"):
+                per_day_off[d] += 1
+            elif label in ("夜", "管夜"):
+                per_day_night_req_user[d] += 1
+            elif label == "日":
+                per_day_day_req_user[d] += 1
+
+    # 希望が多い日 (上位5件)
+    sorted_days = sorted(
+        [(d, per_day_off[d]) for d in range(num_days)],
+        key=lambda x: -x[1],
+    )[:5]
+    per_day_max_requests = [{"day": d + 1, "offRequests": cnt} for d, cnt in sorted_days if cnt > 0]
+
+    # 希望休が多すぎて要件を満たせない日を検出
+    excessive: list = []
+    for d in range(num_days):
+        off_req = per_day_off[d]
+        night_req = night_req_table[d]
+        day_req = weekend_day_staff if d in weekends else weekday_day_staff
+        # この日に勤務可能 (forced 休以外) なナース数
+        feasible_workers = total_active - off_req
+        needed = night_req + day_req
+        if feasible_workers < needed:
+            excessive.append({
+                "day": d + 1,
+                "offRequests": off_req,
+                "nightReq": night_req,
+                "dayReq": day_req,
+                "neededWorkers": needed,
+                "feasibleWorkers": feasible_workers,
+                "shortfall": needed - feasible_workers,
+            })
+
+    return {
+        "totalRequests": total_requests,
+        "perDayMaxRequests": per_day_max_requests,
+        "daysWithExcessiveRequests": excessive,
+    }
+
+
 def _preflight_diagnostics(active_nurses, night_req_table, weekday_day_staff,
                             weekend_day_staff, weekends, num_days, max_night_default,
                             max_consec=3, max_days_off=10,
@@ -552,6 +866,26 @@ def _preflight_diagnostics(active_nurses, night_req_table, weekday_day_staff,
                 f"({len(orphan_req_ids)}件) — ソルバーは無視して進めます"
             )
 
+    # 個別ナースサマリ・希望分布
+    nurse_summary, position_stats, max_buckets = _per_nurse_summary(
+        active_nurses, max_night_default, requests or {}, prev_month or {}
+    )
+    request_dist = _request_distribution(
+        requests or {}, active_nurses, num_days, weekday_day_staff,
+        weekend_day_staff, weekends, night_req_table
+    )
+
+    # 希望が多すぎて要件を満たせない日があれば warning
+    if request_dist["daysWithExcessiveRequests"]:
+        days_str = ", ".join(
+            f"Day{x['day']}(休望{x['offRequests']}/必要{x['neededWorkers']})"
+            for x in request_dist["daysWithExcessiveRequests"][:3]
+        )
+        warnings.append(
+            f"希望休が必要人数を圧迫: {days_str}"
+            f" (詳細: requestStats.daysWithExcessiveRequests)"
+        )
+
     return {
         "parsedConfig": parsed_config,
         "nightDemand": night_demand,
@@ -562,6 +896,10 @@ def _preflight_diagnostics(active_nurses, night_req_table, weekday_day_staff,
         "dayCapableCount": len(day_capable),
         "orphanPrevIds": orphan_prev_ids,
         "orphanRequestIds": orphan_req_ids,
+        "perPositionStats": position_stats,
+        "nightCapableByMaxShifts": max_buckets,
+        "individualNurseSummary": nurse_summary,
+        "requestStats": request_dist,
         "perDayDemandSample": [
             {"day": d + 1,
              "isWeekend": d in weekends,
@@ -643,6 +981,16 @@ def _validate(data, params, relax_level=0):
 # Main entry
 # ──────────────────────────────────────
 def solve_schedule(request_data: dict) -> list[dict]:
+    # ── FULL REQUEST DUMP (Cloud Run logs で原因追跡用) ──
+    try:
+        import json as _json
+        dump = _json.dumps(request_data, ensure_ascii=False, default=str)
+        if len(dump) > 8000:
+            dump = dump[:8000] + f"...[truncated, full length={len(dump)}]"
+        _log(f"FULL REQUEST DUMP: {dump}")
+    except Exception as e:
+        _log(f"REQUEST DUMP failed: {e}")
+
     nurses = request_data["nurses"]
     num_days = request_data["daysInMonth"]
     year = request_data.get("year", 2026)
@@ -755,6 +1103,19 @@ def solve_schedule(request_data: dict) -> list[dict]:
             if diagnostics["warnings"]:
                 err_msg += " — " + "; ".join(diagnostics["warnings"][:2])
             _log(f"!!! {label} 全 relax_level で失敗: {err_msg}")
+
+            # UNSAT core 解析 (最初のパターンの失敗時のみ実施: 結果は同条件で同じ)
+            unsat_info = None
+            if pat_idx == 0:
+                _log(f"!!! UNSAT core 解析を開始 (assumption-based)")
+                t_unsat = time.time()
+                try:
+                    unsat_info = _diagnose_infeasible(params)
+                    _log(f"!!! UNSAT core: {unsat_info.get('sufficientAssumptions')} ({time.time()-t_unsat:.2f}s)")
+                except Exception as e:
+                    _log(f"!!! UNSAT core 解析失敗: {e}")
+                    unsat_info = {"error": str(e)}
+
             results.append({
                 "label": label,
                 "data": {},
@@ -766,6 +1127,7 @@ def solve_schedule(request_data: dict) -> list[dict]:
                     "validationErrors": chosen_errors[:10],
                     "attempts": attempts,
                     "diagnostics": diagnostics,
+                    "unsatCore": unsat_info,
                     # フロント描画が undefined で落ちないように 0 埋め
                     "relaxLevel": -1,
                     "nightBalance": 0,
