@@ -654,6 +654,185 @@ def _post_process(solution_raw, active_nurses, forced_label, num_days):
     return output
 
 
+def _detect_forced_conflicts(active_nurses, requests, prev_month, num_days):
+    """forced cells (希望 + prev_month) の chain 整合性を検証。
+
+    nightChain + forcedCells が UNSAT になる典型ケース:
+      A) 夜希望の翌日に 夜/日/管夜/管明 等の非 OFF が固定
+      B) 夜希望の翌々日に 日/管夜/管明 が固定 (休/有/夜/明 ならOK)
+      C) 管夜希望の翌日が 管明 でない / 翌々日が休でない
+      D) 明希望の前日が 夜 でない (prev_month の last day が夜なら例外)
+      E) 同日に異なる希望/前月固定の重複
+    """
+    OFF_LABELS = {"休", "有", "明", "管明"}
+    conflicts: list = []
+    per_nurse_locked: list = []
+    summary_by_nurse: dict = {}
+
+    for n in active_nurses:
+        nid = str(n["id"])
+        # Collect forced cells per (day): {d: {"label", "source"}}
+        locked: dict = {}
+
+        # 1. requests (highest priority)
+        nurse_reqs = requests.get(nid, {}) if isinstance(requests, dict) else {}
+        if isinstance(nurse_reqs, dict):
+            for day_str, label in nurse_reqs.items():
+                try:
+                    d = int(day_str) - 1
+                except (TypeError, ValueError):
+                    continue
+                if not (0 <= d < num_days):
+                    continue
+                if d in locked and locked[d]["label"] != label:
+                    conflicts.append({
+                        "nurseId": nid,
+                        "name": n.get("name", ""),
+                        "day": d + 1,
+                        "type": "duplicate_request",
+                        "message": f"同日に異なる希望: {locked[d]['label']} vs {label}",
+                    })
+                locked[d] = {"label": label, "source": "request"}
+
+        # 2. prev_month (skip if request already locked the same cell)
+        nurse_prev = prev_month.get(nid, {}) if isinstance(prev_month, dict) else {}
+        if isinstance(nurse_prev, dict):
+            for key, label in nurse_prev.items():
+                if str(key).startswith("_"):
+                    continue
+                try:
+                    d = int(key) - 1
+                except (TypeError, ValueError):
+                    continue
+                if not (0 <= d < num_days):
+                    continue
+                if d in locked:
+                    if locked[d]["label"] != label:
+                        conflicts.append({
+                            "nurseId": nid,
+                            "name": n.get("name", ""),
+                            "day": d + 1,
+                            "type": "request_vs_prev_conflict",
+                            "message": f"希望({locked[d]['label']}) と 前月({label}) で固定値が異なる",
+                        })
+                    continue
+                locked[d] = {"label": label, "source": "prev_month"}
+
+        if not locked:
+            continue
+
+        # 3. Chain consistency check (in date order)
+        sorted_days = sorted(locked.keys())
+        for d in sorted_days:
+            lbl = locked[d]["label"]
+            src = locked[d]["source"]
+
+            # Case A/B: 夜希望
+            if lbl == "夜":
+                # day d+1: must be 明/休/有 (or unforced)
+                if d + 1 < num_days and (d + 1) in locked:
+                    nxt = locked[d + 1]["label"]
+                    if nxt not in ("明", "休", "有"):
+                        conflicts.append({
+                            "nurseId": nid,
+                            "name": n.get("name", ""),
+                            "day": d + 1,
+                            "type": "night_then_invalid_d1",
+                            "message": (
+                                f"day{d+1}=夜({src}) → day{d+2}={nxt}({locked[d+1]['source']}) 固定。"
+                                f" 明/休/有 のいずれかであるべき"
+                            ),
+                        })
+                # day d+2: must be 休/有/夜/明 (2連夜勤の余地)
+                if d + 2 < num_days and (d + 2) in locked:
+                    nxt2 = locked[d + 2]["label"]
+                    if nxt2 not in ("休", "有", "夜", "明"):
+                        conflicts.append({
+                            "nurseId": nid,
+                            "name": n.get("name", ""),
+                            "day": d + 1,
+                            "type": "night_then_invalid_d2",
+                            "message": (
+                                f"day{d+1}=夜({src}) → day{d+3}={nxt2}({locked[d+2]['source']}) 固定。"
+                                f" 休/有/夜/明 のいずれかであるべき"
+                            ),
+                        })
+
+            # Case C: 管夜希望
+            elif lbl == "管夜":
+                if d + 1 < num_days and (d + 1) in locked and locked[d + 1]["label"] != "管明":
+                    conflicts.append({
+                        "nurseId": nid,
+                        "name": n.get("name", ""),
+                        "day": d + 1,
+                        "type": "kannight_invalid_d1",
+                        "message": f"day{d+1}=管夜({src}) → day{d+2}={locked[d+1]['label']} 固定。管明であるべき",
+                    })
+                if d + 2 < num_days and (d + 2) in locked and locked[d + 2]["label"] not in ("休", "有"):
+                    conflicts.append({
+                        "nurseId": nid,
+                        "name": n.get("name", ""),
+                        "day": d + 1,
+                        "type": "kannight_invalid_d2",
+                        "message": f"day{d+1}=管夜({src}) → day{d+3}={locked[d+2]['label']} 固定。休/有 のいずれかであるべき",
+                    })
+
+            # Case D: 明希望 → 前日は 夜 のはず
+            elif lbl == "明":
+                if d > 0:
+                    if (d - 1) in locked:
+                        prv = locked[d - 1]["label"]
+                        if prv != "夜":
+                            conflicts.append({
+                                "nurseId": nid,
+                                "name": n.get("name", ""),
+                                "day": d + 1,
+                                "type": "ake_no_prev_night",
+                                "message": f"day{d+1}=明({src}) だが前日 day{d}={prv}({locked[d-1]['source']}) 固定。夜であるべき",
+                            })
+                # 明 の翌日も 休/有/夜
+                if d + 1 < num_days and (d + 1) in locked:
+                    nxt = locked[d + 1]["label"]
+                    if nxt not in ("休", "有", "夜"):
+                        conflicts.append({
+                            "nurseId": nid,
+                            "name": n.get("name", ""),
+                            "day": d + 1,
+                            "type": "ake_then_invalid",
+                            "message": f"day{d+1}=明({src}) → day{d+2}={nxt}({locked[d+1]['source']}) 固定。休/有/夜であるべき",
+                        })
+
+            # Case E: 管明希望 → 前日は 管夜 のはず
+            elif lbl == "管明":
+                if d > 0 and (d - 1) in locked and locked[d - 1]["label"] != "管夜":
+                    conflicts.append({
+                        "nurseId": nid,
+                        "name": n.get("name", ""),
+                        "day": d + 1,
+                        "type": "kanake_no_prev_kannight",
+                        "message": f"day{d+1}=管明({src}) だが前日 day{d}={locked[d-1]['label']} 固定。管夜であるべき",
+                    })
+
+        per_nurse_locked.append({
+            "id": n["id"],
+            "name": n.get("name", ""),
+            "lockedCount": len(locked),
+            "lockedDays": [
+                {"day": d + 1, "shift": locked[d]["label"], "source": locked[d]["source"]}
+                for d in sorted_days
+            ],
+        })
+        summary_by_nurse[nid] = locked
+
+    # 矛盾のあるナースのみで perNurseLockedDays を絞る (情報量制御)
+    conflict_nurse_ids = {c["nurseId"] for c in conflicts}
+    locked_with_conflict = [
+        x for x in per_nurse_locked if str(x["id"]) in conflict_nurse_ids
+    ]
+
+    return conflicts, per_nurse_locked, locked_with_conflict
+
+
 def _per_nurse_summary(active_nurses, max_night_default, requests, prev_month):
     """個別ナースのケイパビリティと希望サマリ。INFEASIBLE 解析の手がかり用。"""
     summary = []
@@ -886,6 +1065,17 @@ def _preflight_diagnostics(active_nurses, night_req_table, weekday_day_staff,
             f" (詳細: requestStats.daysWithExcessiveRequests)"
         )
 
+    # forced cells の chain 整合性
+    forced_conflicts, per_nurse_locked, per_nurse_locked_conflict = \
+        _detect_forced_conflicts(active_nurses, requests or {}, prev_month or {}, num_days)
+    if forced_conflicts:
+        sample = forced_conflicts[:3]
+        msg = "; ".join(c["message"] for c in sample)
+        warnings.append(
+            f"希望/前月固定の {len(forced_conflicts)} 件で chain 矛盾: {msg}"
+            f"{' …' if len(forced_conflicts) > 3 else ''} (詳細: forcedCellConflicts)"
+        )
+
     return {
         "parsedConfig": parsed_config,
         "nightDemand": night_demand,
@@ -900,6 +1090,9 @@ def _preflight_diagnostics(active_nurses, night_req_table, weekday_day_staff,
         "nightCapableByMaxShifts": max_buckets,
         "individualNurseSummary": nurse_summary,
         "requestStats": request_dist,
+        "forcedCellConflicts": forced_conflicts,
+        "perNurseLockedDays": per_nurse_locked,
+        "perNurseLockedDaysConflictOnly": per_nurse_locked_conflict,
         "perDayDemandSample": [
             {"day": d + 1,
              "isWeekend": d in weekends,
