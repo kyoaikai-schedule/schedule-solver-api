@@ -2,6 +2,7 @@ import os
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from solver import solve_schedule
+from solver_team import solve_with_teams
 
 app = FastAPI(title="Nurse Schedule Solver API")
 
@@ -33,6 +34,15 @@ async def solve(request: Request):
     body = await request.json()
     patterns = solve_schedule(body)
     return {"patterns": patterns}
+
+
+@app.post("/solve_team")
+async def solve_team(request: Request):
+    """フェーズ2: 夜勤チーム編成対応エンドポイント。
+    既存 /solve とは独立。team フィールドを各 nurse に持たせて呼び出す。"""
+    verify_api_key(request)
+    body = await request.json()
+    return solve_with_teams(body)
 
 
 @app.get("/test")
