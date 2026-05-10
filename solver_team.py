@@ -12,6 +12,7 @@
 """
 
 from __future__ import annotations
+import math
 import sys
 import time
 from ortools.sat.python import cp_model
@@ -161,13 +162,174 @@ def _check_team_feasibility(
         else f"達成不可能日が想定される (容量不足 {len(issues)} チーム、forced 不在 {len(blocked_days)} 日)"
     )
 
+    # 達成可能上限率 (current max rate):
+    # 各日について、その日 expected な全 team が capacity を持つかを確認
+    # team_demand_actual / team_demand_max でざっくり計算
+    total_days_with_req = sum(1 for r in night_req_table if r > 0)
+    if total_days_with_req == 0:
+        current_max_rate = 1.0
+    else:
+        # 不可能日: 容量不足チーム ⇒ shortage 日数 + blocked_days
+        shortage_total = sum(i.get("shortage", 0) for i in issues)
+        blocked_count = len({(b["day"], b["team"]) for b in blocked_days})
+        unachievable_total = shortage_total + blocked_count
+        achievable_days = max(0, total_days_with_req - unachievable_total)
+        current_max_rate = round(achievable_days / total_days_with_req, 3)
+
     return {
         "isFullyFeasible": is_fully_feasible,
+        "currentMaxRate": current_max_rate,
         "perTeamInfo": per_team_info,
         "issues": issues,
-        "blockedDays": blocked_days[:30],  # 多すぎ防止
+        "blockedDays": blocked_days[:30],
         "diagnosis": diagnosis,
     }
+
+
+def _generate_improvement_suggestions(
+    active_nurses: list,
+    feasibility: dict,
+    max_night_default: int = 7,
+) -> list:
+    """100% 達成不可能な場合の具体的な改善提案を生成。
+
+    feasibility.perTeamInfo を見て不足チームを特定し、以下 3 つを提案:
+      1. 「夜勤可能だが maxNight が低い」ナースの上限を引き上げる
+      2. 「noNightShift=true」のナースを夜勤可能にする
+      3. 「他チームから夜勤可能ナースを異動」(他チーム余裕ありのとき)
+
+    返り値: priority 昇順, expectedCapacity 降順 で上位 5 件まで
+    """
+    suggestions: list = []
+    team_stats = feasibility.get("perTeamInfo", {}) or {}
+
+    for team, stats in team_stats.items():
+        capacity = int(stats.get("capacity", 0))
+        demand = int(stats.get("demand", 0))
+        if demand <= 0 or capacity >= demand:
+            continue  # このチームは問題なし
+
+        shortage = demand - capacity
+        team_nurses = [n for n in active_nurses if n.get("team") == team]
+        active_team_nurses = [n for n in team_nurses if not n.get("noNightShift", False)]
+
+        # 提案1: maxNightShifts を引き上げ
+        if active_team_nurses:
+            current_max_avg = (
+                sum(int(n.get("maxNightShifts", max_night_default)) for n in active_team_nurses)
+                / len(active_team_nurses)
+            )
+            # 必要な平均値: ceil(demand / 夜勤可能人数)
+            required_avg = math.ceil(demand / len(active_team_nurses))
+            if 0 < required_avg <= 12:  # 12回上限なら現実範囲とみなす
+                # maxNight が低い順に shortage 名を抽出
+                lowest = sorted(
+                    active_team_nurses,
+                    key=lambda n: int(n.get("maxNightShifts", max_night_default)),
+                )[: max(1, shortage)]
+                names = [n.get("name", f"id{n.get('id')}") for n in lowest]
+                expected_capacity = len(active_team_nurses) * required_avg
+                suggestions.append({
+                    "priority": 1,
+                    "team": team,
+                    "type": "increase_max_night_shifts",
+                    "title": f"チーム{team}のmaxNightShiftsを引き上げる",
+                    "description": (
+                        f"チーム{team}の夜勤可能{len(active_team_nurses)}名の月内夜勤上限"
+                        f"(現状平均{current_max_avg:.1f}回)を {required_avg}回以上に引き上げる。"
+                        f"特に上限が低い{len(names)}名 ({', '.join(names)}) を見直すと効果的"
+                    ),
+                    "targetNurses": names,
+                    "currentCapacity": capacity,
+                    "expectedCapacity": expected_capacity,
+                    "expectedDemand": demand,
+                    "shortage": shortage,
+                    "feasibility": "easy",
+                })
+
+        # 提案2: noNightShift=true ナースを夜勤可能にする
+        no_night_nurses = [n for n in team_nurses if n.get("noNightShift", False)]
+        for nurse in no_night_nurses:
+            added = int(nurse.get("maxNightShifts", max_night_default)) or max_night_default
+            if added <= 0:
+                added = max_night_default
+            new_capacity = capacity + added
+            nurse_name = nurse.get("name") or f"id{nurse.get('id')}"
+            position = nurse.get("position", "")
+            achievement_note = (
+                "達成" if new_capacity >= demand
+                else f"満たすには更に{demand - new_capacity}不足"
+            )
+            suggestions.append({
+                "priority": 2,
+                "team": team,
+                "type": "enable_night_shift",
+                "title": f"{nurse_name}を夜勤可能にする",
+                "description": (
+                    f"チーム{team}の{nurse_name}"
+                    f"({position}) は現在 noNightShift=true (夜勤不可)。"
+                    f"夜勤可能にすると容量が {capacity}→{new_capacity}に増加 "
+                    f"(必要 {demand} を{achievement_note})"
+                ),
+                "targetNurses": [nurse_name],
+                "currentCapacity": capacity,
+                "expectedCapacity": new_capacity,
+                "expectedDemand": demand,
+                "shortage": shortage,
+                "feasibility": "medium",
+            })
+
+        # 提案3: 他チームからの異動 (他チームが余裕あり)
+        for other_team, other_stats in team_stats.items():
+            if other_team == team:
+                continue
+            other_capacity = int(other_stats.get("capacity", 0))
+            other_demand = int(other_stats.get("demand", 0))
+            other_surplus = other_capacity - other_demand
+            if other_surplus <= 0:
+                continue
+            other_nurses_active = [
+                n for n in active_nurses
+                if n.get("team") == other_team and not n.get("noNightShift", False)
+            ]
+            if len(other_nurses_active) <= 1:
+                continue  # 1 名のみは異動候補外
+            # maxNight が高いナースを移籍候補
+            candidate = max(
+                other_nurses_active,
+                key=lambda n: int(n.get("maxNightShifts", max_night_default)),
+            )
+            cand_max = int(candidate.get("maxNightShifts", max_night_default))
+            new_to_capacity = capacity + cand_max
+            new_from_capacity = other_capacity - cand_max
+            # 異動後に from チームの容量が demand を割らない場合のみ提案
+            if new_from_capacity < other_demand:
+                continue
+            suggestions.append({
+                "priority": 3,
+                "team": team,
+                "type": "transfer_nurse",
+                "title": f"{candidate.get('name')}をチーム{other_team}→{team}に異動",
+                "description": (
+                    f"チーム{other_team}は容量{other_capacity}/必要{other_demand}で"
+                    f"{other_surplus}余裕あり。{candidate.get('name')}"
+                    f"(maxNight={cand_max})をチーム{team}に異動すると"
+                    f"チーム{team} 容量 {capacity}→{new_to_capacity} に改善"
+                    f"(チーム{other_team} は {other_capacity}→{new_from_capacity} で必要を満たす)"
+                ),
+                "targetNurses": [candidate.get("name", f"id{candidate.get('id')}")],
+                "fromTeam": other_team,
+                "toTeam": team,
+                "currentCapacity": capacity,
+                "expectedCapacity": new_to_capacity,
+                "expectedDemand": demand,
+                "shortage": shortage,
+                "feasibility": "medium",
+            })
+
+    # priority 昇順、expectedCapacity 降順 (より大きく改善するものを優先)
+    suggestions.sort(key=lambda s: (s.get("priority", 99), -s.get("expectedCapacity", 0)))
+    return suggestions[:5]
 
 
 def _team_diagnostics(active_nurses: list, night_pattern: list[int]) -> dict:
@@ -784,7 +946,16 @@ def solve_with_teams(request_data: dict) -> dict:
         requests, prev_month, max_night,
     )
     _log(f"feasibility: isFullyFeasible={feasibility['isFullyFeasible']} "
-         f"issues={len(feasibility['issues'])} blocked={len(feasibility['blockedDays'])}")
+         f"issues={len(feasibility['issues'])} blocked={len(feasibility['blockedDays'])} "
+         f"currentMaxRate={feasibility['currentMaxRate']}")
+
+    # 改善3: 100% 不可能なら改善提案を生成
+    improvement_suggestions = []
+    if not feasibility["isFullyFeasible"]:
+        improvement_suggestions = _generate_improvement_suggestions(
+            active_nurses, feasibility, max_night,
+        )
+        _log(f"improvement suggestions: {len(improvement_suggestions)} 件")
 
     # 既存 preflight も付加 (既存 solve と同条件で診断)
     preflight = _preflight_diagnostics(
@@ -916,6 +1087,7 @@ def solve_with_teams(request_data: dict) -> dict:
             "attemptsTeam": attempts_team,
             "diagnostics": team_diag,
             "feasibility": feasibility,
+            "improvementSuggestions": improvement_suggestions,
         })
 
         # 既存類似のメトリクス計算 (簡略)
