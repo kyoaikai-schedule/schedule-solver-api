@@ -717,12 +717,12 @@ def _solve_one_pattern_with_teams(
     solver = cp_model.CpSolver()
     # 改善3: パターンごとに異なる random_seed を割り当てて多様性を担保
     solver.parameters.random_seed = 1000 + pat_idx * 137 + relax_team * 7
-    # 改善2: 100% 達成を目指して探索時間を 15s → 60s に延長
-    # (3パターン × 1 relax (relax=0で多くは収まる) ≈ 180s, frontend 300s timeout 内)
-    solver.parameters.max_time_in_seconds = 60
+    # 504対策: Cloud Run timeout 300s に対し 45s × 3pat ≈ 135s で余裕を確保
+    # (旧 60s/pat ≈ 180s は Cloud Run timeout 120s 時代に超過していた原因)
+    solver.parameters.max_time_in_seconds = 45
     solver.parameters.num_workers = 8
     solver.parameters.randomize_search = True
-    # 改善2: 線形化レベル up + presolve で探索精度向上
+    # 100% 探索精度: 線形化 lv2 + presolve 明示
     solver.parameters.linearization_level = 2
     solver.parameters.cp_model_presolve = True
     status = solver.solve(model)
