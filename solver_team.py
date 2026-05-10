@@ -105,12 +105,15 @@ def _solve_one_pattern_with_teams(
     forbidden_solutions: list,
     relax_team: int,
     relax_level: int = 0,
+    pat_idx: int = 0,
 ) -> dict:
     """solver._solve_one_pattern と同じ制約 + チームペナルティ。
 
     relax_team:
       0 → チームペナルティ強 (PENALTY_TEAM_MISSING_STRONG)
       1 → チームペナルティ弱 (PENALTY_TEAM_MISSING_WEAK)
+    pat_idx:
+      0..N-1, 各パターンに異なる random_seed を割り当てて多様性を担保
     relax_level:
       日勤・夜勤人数要件の緩和度合い (既存と同じ意味、本関数内では 0 固定で OK)
     """
@@ -355,7 +358,7 @@ def _solve_one_pattern_with_teams(
         penalties.append((off_under, 200))
 
     # ===========================
-    # 既出解の禁止
+    # 既出解の禁止 (改善3: random_seed で多様性が出るため、要求閾値を 50% → 25% に緩和)
     # ===========================
     for fb_idx, forbidden in enumerate(forbidden_solutions):
         diffs = []
@@ -371,7 +374,9 @@ def _solve_one_pattern_with_teams(
                 model.add(shifts[(n, d)] == forbidden[nid][d]).only_enforce_if(b.negated())
                 diffs.append(b)
         if diffs:
-            model.add(sum(diffs) >= max(1, num_nurses // 2))
+            # 旧: num_nurses // 2 (例: 25名 → 12セル差) → 制約強くて pat2,3 が劣化
+            # 新: num_nurses // 4 (例: 25名 → 6セル差) → seed の多様性と組合せで十分
+            model.add(sum(diffs) >= max(1, num_nurses // 4))
 
     # ===========================
     # ★ チームペナルティ (本拡張のメイン)
@@ -427,8 +432,15 @@ def _solve_one_pattern_with_teams(
         model.minimize(total_penalty)
 
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = 10
-    solver.parameters.num_workers = 4
+    # 改善3: パターンごとに異なる random_seed を割り当てて多様性を担保。
+    # 同じ pat_idx + relax_team の組合せでは決定論的 (再実行で同じ結果)。
+    solver.parameters.random_seed = 1000 + pat_idx * 137 + relax_team * 7
+    # 探索時間を 10s → 15s に延長 (3パターン × 3 relax = 最大 9 試行 ≈ 135s)
+    solver.parameters.max_time_in_seconds = 15
+    # workers=8 で並列探索を強化 (Cloud Run の vCPU 数に依存)
+    solver.parameters.num_workers = 8
+    # 並列でも確定的探索のために seed を固定 + シャッフルを有効に
+    solver.parameters.randomize_search = True
     status = solver.solve(model)
     status_name = solver.status_name(status)
 
@@ -676,7 +688,8 @@ def solve_with_teams(request_data: dict) -> dict:
 
             # relax_team 0 or 1: チームペナルティ付きで solve
             res = _solve_one_pattern_with_teams(
-                params, forbidden_solutions, relax_team=relax_team, relax_level=0
+                params, forbidden_solutions, relax_team=relax_team, relax_level=0,
+                pat_idx=pat_idx,
             )
             elapsed = time.time() - t0
             attempts_team.append({
