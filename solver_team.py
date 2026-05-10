@@ -34,11 +34,15 @@ def _log(msg: str) -> None:
     print(f"[solver_team] {msg}", file=sys.stderr, flush=True)
 
 
-# ペナルティ重み
-PENALTY_TEAM_MISSING_STRONG = 100  # relax_team=0
-PENALTY_TEAM_MISSING_WEAK = 20     # relax_team=1
-PENALTY_TEAM_OVERLAP = 30          # 重複 (常時)
-PENALTY_TEAM_RESTING_WORK = 30     # 「今日休むはず」のチームが夜勤に出ている
+# ペナルティ重み (改善2: 100% 達成を目指して大幅増強)
+# 他制約のソフトペナルティとの比較:
+#   night balance diff: 300, 2連 night excess: 500, off_over/under: 200,
+#   night_dev_penalties (relax2): 5000, day_short (relax1+): 5000
+# チーム制約は night balance より優先、人数要件 (5000) は侵さないバランス
+PENALTY_TEAM_MISSING_STRONG = 1000  # relax_team=0  (旧 100 → 1000)
+PENALTY_TEAM_MISSING_WEAK = 200     # relax_team=1  (旧  20 →  200)
+PENALTY_TEAM_OVERLAP = 300          # 重複 (旧 30 → 300)
+PENALTY_TEAM_RESTING_WORK = 300     # 休み予定チームの夜勤 (旧 30 → 300)
 
 
 def _used_teams_count(night_pattern: list[int]) -> int:
@@ -51,6 +55,119 @@ def _used_teams_count(night_pattern: list[int]) -> int:
 def _team_letters(count: int) -> list[str]:
     """0..N から ['A','B',...] を生成 (最大5)"""
     return ['A', 'B', 'C', 'D', 'E'][:max(0, min(5, count))]
+
+
+def _check_team_feasibility(
+    active_nurses: list,
+    night_req_table: list,
+    used_teams: list[str],
+    requests: dict,
+    prev_month: dict,
+    max_night_default: int,
+) -> dict:
+    """各チームから 1 名ずつ夜勤に配置することが数学的に可能か診断。
+
+    各チーム T について:
+      capacity_T = sum(maxNightShifts) for nurses in T (noNightShift 除外)
+      demand_T = expected_T (夜勤人数 ≥ team-rank の日数)
+    capacity_T < demand_T なら数学的に達成不可。
+    """
+    issues: list = []
+    per_team_info: dict = {}
+
+    # 各チームの demand: チーム T が expected に含まれる日数を計算
+    # T は used_teams の 0-based index に対応 (A=0, B=1, ...)
+    team_demand: dict = {t: 0 for t in used_teams}
+    for d, req in enumerate(night_req_table):
+        if req <= 0:
+            continue
+        # required = req のとき expected = used_teams[:req]
+        for t in used_teams[:min(req, len(used_teams))]:
+            team_demand[t] += 1
+
+    # 各チームの capacity (夜勤可能ナースの maxNightShifts 合計)
+    for team in used_teams:
+        team_nurses = [n for n in active_nurses
+                       if n.get("team") == team and not n.get("noNightShift", False)]
+        capacity = sum(int(n.get("maxNightShifts", max_night_default)) for n in team_nurses)
+        demand = team_demand.get(team, 0)
+        per_team_info[team] = {
+            "count": len(team_nurses),
+            "capacity": capacity,
+            "demand": demand,
+        }
+        if capacity < demand:
+            issues.append({
+                "team": team,
+                "nurseCount": len(team_nurses),
+                "capacity": capacity,
+                "demand": demand,
+                "shortage": demand - capacity,
+                "reason": (
+                    f"チーム{team} の夜勤可能容量 {capacity} (={len(team_nurses)}名 × maxNight) "
+                    f"< 月内必要数 {demand}、不足 {demand - capacity}"
+                ),
+            })
+
+    # 希望休/前月で当日チーム全員が forced 不在になる日も検出
+    nid_to_team = {str(n["id"]): n.get("team") for n in active_nurses}
+    nurses_in_team: dict = {t: set() for t in used_teams}
+    for n in active_nurses:
+        t = n.get("team")
+        if t and t in nurses_in_team and not n.get("noNightShift", False):
+            nurses_in_team[t].add(str(n["id"]))
+
+    forced_off_per_day: dict = {}  # day_idx -> {nid: True}
+    for nid, reqs in (requests or {}).items():
+        if not isinstance(reqs, dict):
+            continue
+        for ds, lbl in reqs.items():
+            try:
+                d = int(ds) - 1
+            except (TypeError, ValueError):
+                continue
+            if lbl in ("休", "有", "明", "管明"):
+                forced_off_per_day.setdefault(d, set()).add(str(nid))
+    for nid, prev in (prev_month or {}).items():
+        if not isinstance(prev, dict):
+            continue
+        for k, lbl in prev.items():
+            if str(k).startswith("_"):
+                continue
+            try:
+                d = int(k) - 1
+            except (TypeError, ValueError):
+                continue
+            if lbl in ("休", "有", "明", "管明"):
+                forced_off_per_day.setdefault(d, set()).add(str(nid))
+
+    blocked_days: list = []
+    for d, req in enumerate(night_req_table):
+        if req <= 0:
+            continue
+        expected = used_teams[:min(req, len(used_teams))]
+        for team in expected:
+            available = nurses_in_team.get(team, set()) - forced_off_per_day.get(d, set())
+            if not available:
+                blocked_days.append({
+                    "day": d + 1,
+                    "team": team,
+                    "reason": f"day{d+1}: チーム{team} の夜勤可能ナース全員が forced 休/有/明 状態",
+                })
+
+    is_fully_feasible = len(issues) == 0 and len(blocked_days) == 0
+    diagnosis = (
+        "数学的に 100% 達成可能" if is_fully_feasible
+        else f"達成不可能日が想定される (容量不足 {len(issues)} チーム、forced 不在 {len(blocked_days)} 日)"
+    )
+
+    return {
+        "isFullyFeasible": is_fully_feasible,
+        "perTeamInfo": per_team_info,
+        "issues": issues,
+        "blockedDays": blocked_days[:30],  # 多すぎ防止
+        "diagnosis": diagnosis,
+    }
 
 
 def _team_diagnostics(active_nurses: list, night_pattern: list[int]) -> dict:
@@ -358,25 +475,29 @@ def _solve_one_pattern_with_teams(
         penalties.append((off_under, 200))
 
     # ===========================
-    # 既出解の禁止 (改善3: random_seed で多様性が出るため、要求閾値を 50% → 25% に緩和)
+    # 既出解の禁止 (改善2 パターン戦略)
+    #   pat_idx=0 → forbidden 制約なし (純粋に最適 = balanceRate 最大)
+    #   pat_idx=1 → 25% 差以上 (pat0 から軽微変更)
+    #   pat_idx=2 → 50% 差以上 (pat0 から大きく変更)
     # ===========================
-    for fb_idx, forbidden in enumerate(forbidden_solutions):
-        diffs = []
-        for n in N:
-            nid = str(active_nurses[n]["id"])
-            if nid not in forbidden:
-                continue
-            for d in D:
-                if (n, d) in forced_shift:
+    if pat_idx >= 1 and forbidden_solutions:
+        # 直前のパターンとの差分のみ考慮 (累積禁止だと pat3 が過剰制約になる)
+        diff_threshold = num_nurses // 4 if pat_idx == 1 else num_nurses // 2
+        for fb_idx, forbidden in enumerate(forbidden_solutions):
+            diffs = []
+            for n in N:
+                nid = str(active_nurses[n]["id"])
+                if nid not in forbidden:
                     continue
-                b = model.new_bool_var(f"fb_{fb_idx}_{n}_{d}")
-                model.add(shifts[(n, d)] != forbidden[nid][d]).only_enforce_if(b)
-                model.add(shifts[(n, d)] == forbidden[nid][d]).only_enforce_if(b.negated())
-                diffs.append(b)
-        if diffs:
-            # 旧: num_nurses // 2 (例: 25名 → 12セル差) → 制約強くて pat2,3 が劣化
-            # 新: num_nurses // 4 (例: 25名 → 6セル差) → seed の多様性と組合せで十分
-            model.add(sum(diffs) >= max(1, num_nurses // 4))
+                for d in D:
+                    if (n, d) in forced_shift:
+                        continue
+                    b = model.new_bool_var(f"fb_{fb_idx}_{n}_{d}")
+                    model.add(shifts[(n, d)] != forbidden[nid][d]).only_enforce_if(b)
+                    model.add(shifts[(n, d)] == forbidden[nid][d]).only_enforce_if(b.negated())
+                    diffs.append(b)
+            if diffs:
+                model.add(sum(diffs) >= max(1, diff_threshold))
 
     # ===========================
     # ★ チームペナルティ (本拡張のメイン)
@@ -432,15 +553,16 @@ def _solve_one_pattern_with_teams(
         model.minimize(total_penalty)
 
     solver = cp_model.CpSolver()
-    # 改善3: パターンごとに異なる random_seed を割り当てて多様性を担保。
-    # 同じ pat_idx + relax_team の組合せでは決定論的 (再実行で同じ結果)。
+    # 改善3: パターンごとに異なる random_seed を割り当てて多様性を担保
     solver.parameters.random_seed = 1000 + pat_idx * 137 + relax_team * 7
-    # 探索時間を 10s → 15s に延長 (3パターン × 3 relax = 最大 9 試行 ≈ 135s)
-    solver.parameters.max_time_in_seconds = 15
-    # workers=8 で並列探索を強化 (Cloud Run の vCPU 数に依存)
+    # 改善2: 100% 達成を目指して探索時間を 15s → 60s に延長
+    # (3パターン × 1 relax (relax=0で多くは収まる) ≈ 180s, frontend 300s timeout 内)
+    solver.parameters.max_time_in_seconds = 60
     solver.parameters.num_workers = 8
-    # 並列でも確定的探索のために seed を固定 + シャッフルを有効に
     solver.parameters.randomize_search = True
+    # 改善2: 線形化レベル up + presolve で探索精度向上
+    solver.parameters.linearization_level = 2
+    solver.parameters.cp_model_presolve = True
     status = solver.solve(model)
     status_name = solver.status_name(status)
 
@@ -462,13 +584,19 @@ def _compute_team_metrics(
     active_nurses: list,
     night_req_table: list[int],
     used_teams: list[str],
+    feasibility: dict | None = None,
 ) -> dict:
-    """生成後の解からチームバランス指標を算出"""
+    """生成後の解からチームバランス指標を算出 + 達成不可能日を分析"""
     nid_to_team = {str(n["id"]): n.get("team") for n in active_nurses}
 
     per_day_balance = []
     balanced_count = 0
     total_days_with_req = 0
+    unachievable: list = []
+    blocked_set = set()
+    if feasibility:
+        for bd in feasibility.get("blockedDays", []):
+            blocked_set.add((bd["day"], bd["team"]))
 
     for d in range(len(night_req_table)):
         required = night_req_table[d]
@@ -517,6 +645,26 @@ def _compute_team_metrics(
         is_balanced = len(missing) == 0 and len(extra) == 0
         if is_balanced:
             balanced_count += 1
+        else:
+            # 達成不可能日のレポート: missing にあるチームと、その理由を推測
+            for m_team in missing:
+                key = (d + 1, m_team)
+                if key in blocked_set:
+                    reason = f"チーム{m_team} の夜勤可能ナース全員が forced 休/有/明"
+                else:
+                    # 容量不足が原因か、ソルバーが他制約優先したか
+                    cap_issue = next(
+                        (i for i in (feasibility or {}).get("issues", [])
+                         if i.get("team") == m_team), None) if feasibility else None
+                    if cap_issue:
+                        reason = f"チーム{m_team} の月内夜勤容量不足 (capacity={cap_issue['capacity']} < demand={cap_issue['demand']})"
+                    else:
+                        reason = f"チーム{m_team} 不在 (他制約のため solver が他の team を優先)"
+                unachievable.append({
+                    "day": d + 1,
+                    "teamShortage": m_team,
+                    "reason": reason,
+                })
 
         per_day_balance.append({
             "day": d + 1,
@@ -535,6 +683,7 @@ def _compute_team_metrics(
         "balanceRate": round(balance_rate, 3),
         "balancedDays": balanced_count,
         "totalDays": total_days_with_req,
+        "unachievableDays": unachievable[:50],  # 多すぎ防止
     }
 
 
@@ -628,6 +777,14 @@ def solve_with_teams(request_data: dict) -> dict:
         "used_teams": used_teams,
         "team_of_nurse_idx": team_of_nurse_idx,
     }
+
+    # 改善2: 数学的達成可能性チェック (各チームが 100% 達成可能か事前判定)
+    feasibility = _check_team_feasibility(
+        active_nurses, night_req_table, used_teams,
+        requests, prev_month, max_night,
+    )
+    _log(f"feasibility: isFullyFeasible={feasibility['isFullyFeasible']} "
+         f"issues={len(feasibility['issues'])} blocked={len(feasibility['blockedDays'])}")
 
     # 既存 preflight も付加 (既存 solve と同条件で診断)
     preflight = _preflight_diagnostics(
@@ -748,7 +905,8 @@ def solve_with_teams(request_data: dict) -> dict:
         if "raw" in chosen:
             forbidden_solutions.append(chosen["raw"])
         team_metrics = _compute_team_metrics(
-            chosen["data_labels"], active_nurses, night_req_table, used_teams
+            chosen["data_labels"], active_nurses, night_req_table, used_teams,
+            feasibility=feasibility,
         )
         team_metrics.update({
             "teamMode": True,
@@ -757,6 +915,7 @@ def solve_with_teams(request_data: dict) -> dict:
             "fallbackLevel": chosen_relax_team,
             "attemptsTeam": attempts_team,
             "diagnostics": team_diag,
+            "feasibility": feasibility,
         })
 
         # 既存類似のメトリクス計算 (簡略)
