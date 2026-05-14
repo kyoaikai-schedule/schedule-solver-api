@@ -403,18 +403,32 @@ def _solve_one_pattern(params, forbidden_solutions, relax_level=0):
     #  として次月生成時に渡す前提)
 
     # ── 連続勤務制限 ──
+    # relax_level 0-2: max_consec をハード
+    # relax_level 3  : max_consec+1 までハード許容
+    # relax_level 4  : ハード制約なし、ペナルティのみ
+    max_consec_eff = max_consec + 1 if relax_level == 3 else max_consec
+    consec_excess_penalties: list[tuple] = []
     for n in N:
         nurse = active_nurses[n]
         nid = str(nurse["id"])
         prev_consec = prev_month.get(nid, {}).get("_consecDays", 0)
 
-        window = max_consec + 1
-        for d in D:
-            if d + window <= num_days:
-                model.add(sum(is_working[(n, d + k)] for k in range(window)) <= max_consec)
+        if relax_level < 4:
+            window = max_consec_eff + 1
+            for d in D:
+                if d + window <= num_days:
+                    model.add(sum(is_working[(n, d + k)] for k in range(window)) <= max_consec_eff)
+        else:
+            # relax_level 4: ソフト化 — max_consec を超えた窓数をペナルティ
+            window = max_consec + 1
+            for d in D:
+                if d + window <= num_days:
+                    excess = model.new_int_var(0, window, f"ce_{n}_{d}")
+                    model.add(excess >= sum(is_working[(n, d + k)] for k in range(window)) - max_consec)
+                    consec_excess_penalties.append((excess, 2000))
 
-        if prev_consec > 0:
-            remaining = max_consec - prev_consec
+        if prev_consec > 0 and relax_level < 4:
+            remaining = max_consec_eff - prev_consec
             if remaining <= 0:
                 if 0 < num_days:
                     model.add(is_working[(n, 0)] == 0)
@@ -446,14 +460,32 @@ def _solve_one_pattern(params, forbidden_solutions, relax_level=0):
                 if forced_shift.get((n, d)) != DAY:
                     model.add(is_day[(n, d)] == 0)
 
-        nurse_max_night = nurse.get("maxNightShifts", max_night)
+        nurse_max_night_base = nurse.get("maxNightShifts", max_night)
+        # relax_level 3: +1 まで許容、relax_level 4: ソフトのみ
+        nurse_max_night_eff = nurse_max_night_base + 1 if relax_level == 3 else nurse_max_night_base
         real_night_terms = [is_night[(n, d)] for d in D if forced_label.get((n, d)) != "管夜"]
         if real_night_terms:
-            model.add(sum(real_night_terms) <= nurse_max_night)
+            if relax_level < 4:
+                model.add(sum(real_night_terms) <= nurse_max_night_eff)
+            # relax_level 4 のソフト化は下のセクションで一括処理
 
-    # ── 夜勤人数（ハード／relax_level=2で緩和）──
+    # ── relax_level 4 用: 夜勤回数超過のソフトペナルティ ──
+    night_count_excess_penalties: list[tuple] = []
+    if relax_level >= 4:
+        for n in N:
+            nurse = active_nurses[n]
+            nurse_max = nurse.get("maxNightShifts", max_night)
+            real_night_terms = [is_night[(n, d)] for d in D if forced_label.get((n, d)) != "管夜"]
+            if real_night_terms:
+                total = sum(real_night_terms)
+                excess = model.new_int_var(0, num_days, f"nme_{n}")
+                model.add(excess >= total - nurse_max)
+                night_count_excess_penalties.append((excess, 2000))
+
+    # ── 夜勤人数（ハード／relax_level=2,3で緩和、=4でソフトのみ）──
     # relax_level 0,1: 完全一致 (== required)
-    # relax_level 2  : ±1 緩和 + ペナルティ
+    # relax_level 2,3: ±1 緩和 + ペナルティ
+    # relax_level 4  : ペナルティのみ (範囲制約なし)
     night_dev_penalties = []
     for d in D:
         required = night_req_table[d]
@@ -463,7 +495,7 @@ def _solve_one_pattern(params, forbidden_solutions, relax_level=0):
         total = sum(terms)
         if relax_level < 2:
             model.add(total == required)
-        else:
+        elif relax_level < 4:
             model.add(total >= max(0, required - 1))
             model.add(total <= required + 1)
             diff = model.new_int_var(-num_nurses, num_nurses, f"nd_{d}")
@@ -471,18 +503,30 @@ def _solve_one_pattern(params, forbidden_solutions, relax_level=0):
             abs_diff = model.new_int_var(0, num_nurses, f"and_{d}")
             model.add_abs_equality(abs_diff, diff)
             night_dev_penalties.append((abs_diff, 5000))
+        else:
+            # relax_level 4: 範囲なし、絶対偏差にペナルティ
+            diff = model.new_int_var(-num_nurses, num_nurses, f"nd_{d}")
+            model.add(diff == total - required)
+            abs_diff = model.new_int_var(0, num_nurses, f"and_{d}")
+            model.add_abs_equality(abs_diff, diff)
+            night_dev_penalties.append((abs_diff, 5000))
 
-    # ── 日勤人数（ハード／relax_level≥1で緩和）──
+    # ── 日勤人数（ハード／relax_level≥1で緩和、=4でソフトのみ）──
     # relax_level 0  : >= required
-    # relax_level 1+ : >= required-1 + ペナルティ
+    # relax_level 1-3: >= required-1 + ペナルティ
+    # relax_level 4  : ペナルティのみ (下限なし)
     day_short_penalties = []
     for d in D:
         required = weekend_day_staff if d in weekends else weekday_day_staff
         total_day = sum(is_day[(n, d)] for n in N)
         if relax_level == 0:
             model.add(total_day >= required)
-        else:
+        elif relax_level < 4:
             model.add(total_day >= max(0, required - 1))
+            short = model.new_int_var(0, num_nurses, f"ds_{d}")
+            model.add(short >= required - total_day)
+            day_short_penalties.append((short, 5000))
+        else:
             short = model.new_int_var(0, num_nurses, f"ds_{d}")
             model.add(short >= required - total_day)
             day_short_penalties.append((short, 5000))
@@ -493,6 +537,8 @@ def _solve_one_pattern(params, forbidden_solutions, relax_level=0):
     penalties: list[tuple] = []
     penalties.extend(night_dev_penalties)
     penalties.extend(day_short_penalties)
+    penalties.extend(consec_excess_penalties)
+    penalties.extend(night_count_excess_penalties)
 
     # 夜勤回数の均等化（管夜除く）
     night_counts = []
@@ -1280,6 +1326,149 @@ def _preflight_diagnostics(active_nurses, night_req_table, weekday_day_staff,
     }
 
 
+def _greedy_fallback(params):
+    """5段階すべて失敗した時の最終フォールバック。
+    ヒューリスティック貪欲法で「ある程度の」勤務表を必ず返す。違反多数でも OK。
+
+    アルゴリズム:
+      1. 全セルを「休」で初期化
+      2. forced_shift/forced_label を反映
+      3. 各日: 夜勤可能な看護師を夜勤回数の少ない順に必要人数割り当て
+         (過去2日に夜勤がない、noNightShift=False、夜勤上限未満、NGペア重複なし)
+         夜勤を入れたら翌日「明」、翌々日「休」を自動セット
+      4. 各日: 日勤可能な看護師を勤務日数の少ない順に必要人数割り当て
+         (現在「休」、noDayShift=False、連続勤務上限まで)
+      5. 残りは「休」のまま返す
+    """
+    active_nurses = params["active_nurses"]
+    num_days = params["num_days"]
+    night_req_table = params["night_req_table"]
+    weekday_day_staff = params["weekday_day_staff"]
+    weekend_day_staff = params["weekend_day_staff"]
+    weekends = params["weekends"]
+    max_consec = params["max_consec"]
+    max_night = params["max_night"]
+    forced_label = params["forced_label"]
+    night_ng_pairs = params.get("night_ng_pairs", [])
+
+    num_nurses = len(active_nurses)
+    if num_nurses == 0 or num_days == 0:
+        return {str(n["id"]): [] for n in active_nurses}
+
+    # 全セル「休」初期化
+    labels: list[list[str]] = [["休"] * num_days for _ in range(num_nurses)]
+
+    # forced_label 反映
+    for (n, d), lbl in forced_label.items():
+        if 0 <= n < num_nurses and 0 <= d < num_days:
+            labels[n][d] = lbl
+
+    # NG ペアの index 化
+    ng_idx_pairs: list[tuple[int, int]] = []
+    for pair in night_ng_pairs:
+        if len(pair) < 2:
+            continue
+        ia = next((i for i, nn in enumerate(active_nurses) if nn["id"] == pair[0]), None)
+        ib = next((i for i, nn in enumerate(active_nurses) if nn["id"] == pair[1]), None)
+        if ia is not None and ib is not None:
+            ng_idx_pairs.append((ia, ib))
+
+    # 現在の夜勤回数 (forced 反映後)
+    night_count = [
+        sum(1 for d in range(num_days) if labels[n][d] in ("夜", "管夜"))
+        for n in range(num_nurses)
+    ]
+    per_nurse_max = [
+        active_nurses[n].get("maxNightShifts", max_night) for n in range(num_nurses)
+    ]
+
+    def can_assign_night(n: int, d: int) -> bool:
+        if labels[n][d] != "休":
+            return False
+        nurse = active_nurses[n]
+        if nurse.get("noNightShift", False):
+            return False
+        if night_count[n] >= per_nurse_max[n]:
+            return False
+        # 過去2日に 夜/管夜 がある → 明/休でなければならず夜不可
+        if d > 0 and labels[n][d - 1] in ("夜", "管夜"):
+            return False
+        if d > 1 and labels[n][d - 2] in ("夜", "管夜"):
+            return False
+        # 翌日/翌々日が forced で非OFF → chain と衝突
+        if d + 1 < num_days and labels[n][d + 1] not in ("休", "明", "管明", "有"):
+            return False
+        if d + 2 < num_days and labels[n][d + 2] not in ("休", "明", "管明", "有"):
+            return False
+        # NG ペア
+        for (a, b) in ng_idx_pairs:
+            if a == n and labels[b][d] in ("夜", "管夜"):
+                return False
+            if b == n and labels[a][d] in ("夜", "管夜"):
+                return False
+        return True
+
+    # Step 1: 夜勤割り当て
+    for d in range(num_days):
+        already = sum(1 for nn in range(num_nurses) if labels[nn][d] in ("夜", "管夜"))
+        need = night_req_table[d] - already
+        if need <= 0:
+            continue
+        candidates = [n for n in range(num_nurses) if can_assign_night(n, d)]
+        candidates.sort(key=lambda n: (night_count[n], n))
+        for n in candidates[:need]:
+            labels[n][d] = "夜"
+            night_count[n] += 1
+            # チェーン自動補完 (まだ「休」のセルのみ書換)
+            if d + 1 < num_days and labels[n][d + 1] == "休":
+                labels[n][d + 1] = "明"
+            # 翌々日はすでに「休」のはずなのでそのまま
+
+    # Step 2: 日勤割り当て
+    work_count = [
+        sum(1 for d in range(num_days) if labels[n][d] in ("日", "夜", "管夜"))
+        for n in range(num_nurses)
+    ]
+
+    def would_exceed_consec(n: int, d: int) -> bool:
+        left = 0
+        i = d - 1
+        while i >= 0 and labels[n][i] in ("日", "夜", "管夜"):
+            left += 1
+            i -= 1
+        right = 0
+        i = d + 1
+        while i < num_days and labels[n][i] in ("日", "夜", "管夜"):
+            right += 1
+            i += 1
+        return (left + 1 + right) > max_consec
+
+    def can_assign_day(n: int, d: int) -> bool:
+        if labels[n][d] != "休":
+            return False
+        nurse = active_nurses[n]
+        if nurse.get("noDayShift", False):
+            return False
+        return not would_exceed_consec(n, d)
+
+    for d in range(num_days):
+        already = sum(1 for nn in range(num_nurses) if labels[nn][d] == "日")
+        req = weekend_day_staff if d in weekends else weekday_day_staff
+        need = req - already
+        if need <= 0:
+            continue
+        candidates = [n for n in range(num_nurses) if can_assign_day(n, d)]
+        candidates.sort(key=lambda n: (work_count[n], n))
+        for n in candidates[:need]:
+            labels[n][d] = "日"
+            work_count[n] += 1
+
+    output: dict[str, list[str]] = {}
+    for n_idx, nurse in enumerate(active_nurses):
+        output[str(nurse["id"])] = labels[n_idx]
+    return output
+
+
 def _validate(data, params, relax_level=0):
     """構造エラーは常にチェック。人数要件は relax_level に応じて緩める。"""
     errors = []
@@ -1305,43 +1494,69 @@ def _validate(data, params, relax_level=0):
             if s == "管明" and d + 1 < len(sh) and sh[d + 1] not in ("休", "有"):
                 errors.append(f"Nurse {nid} Day {d+1}: 管明の翌日が休/有以外({sh[d+1]})")
 
-    # 夜勤人数: relax_level<2 で完全一致要求、relax_level>=2 で ±1 許容
+    # 夜勤人数:
+    #   relax_level<2 : 完全一致要求
+    #   relax_level 2,3 : ±1 許容
+    #   relax_level 4+  : チェックしない（ソフトのみ）
     for d in range(num_days):
         actual = sum(1 for sh in data.values() if sh[d] == "夜")
         req = night_req_table[d]
         if relax_level < 2:
             if actual != req:
                 errors.append(f"Day {d+1}: 夜勤人数 {actual} ≠ 要件 {req}")
-        else:
+        elif relax_level < 4:
             if abs(actual - req) > 1:
                 errors.append(f"Day {d+1}: 夜勤人数 {actual} (要件 {req}, 許容±1超過)")
 
-    # 日勤人数: relax_level==0 で完全要求、relax_level>=1 で -1 許容
+    # 日勤人数:
+    #   relax_level 0   : 完全要求
+    #   relax_level 1-3 : -1 許容
+    #   relax_level 4+  : チェックしない
     for d in range(num_days):
         actual = sum(1 for sh in data.values() if sh[d] == "日")
         req = weekend_day_staff if d in weekends else weekday_day_staff
-        threshold = req if relax_level == 0 else max(0, req - 1)
+        if relax_level == 0:
+            threshold = req
+        elif relax_level < 4:
+            threshold = max(0, req - 1)
+        else:
+            threshold = 0
         if actual < threshold:
             errors.append(f"Day {d+1}: 日勤人数 {actual} < 要件 {threshold}")
 
-    for nid, sh in data.items():
-        consec = 0
-        for d, s in enumerate(sh):
-            if s in WORK_LABELS:
-                consec += 1
-                if consec > max_consec:
-                    errors.append(f"Nurse {nid} Day {d+1}: 連続勤務 {consec}日 (上限{max_consec})")
-            else:
-                consec = 0
+    # 連続勤務:
+    #   relax_level <=2 : max_consec
+    #   relax_level 3   : max_consec + 1
+    #   relax_level >=4 : チェックしない
+    max_consec_threshold = max_consec
+    if relax_level == 3:
+        max_consec_threshold = max_consec + 1
+    if relax_level < 4:
+        for nid, sh in data.items():
+            consec = 0
+            for d, s in enumerate(sh):
+                if s in WORK_LABELS:
+                    consec += 1
+                    if consec > max_consec_threshold:
+                        errors.append(f"Nurse {nid} Day {d+1}: 連続勤務 {consec}日 (上限{max_consec_threshold})")
+                else:
+                    consec = 0
 
-    for nurse in active_nurses:
-        nid = str(nurse["id"])
-        if nid not in data:
-            continue
-        nurse_max = nurse.get("maxNightShifts", max_night)
-        cnt = sum(1 for s in data[nid] if s == "夜")
-        if cnt > nurse_max:
-            errors.append(f"Nurse {nid}: 夜勤 {cnt}回 (上限{nurse_max})")
+    # 夜勤回数:
+    #   relax_level <=2 : 個人上限
+    #   relax_level 3   : 個人上限+1
+    #   relax_level >=4 : チェックしない
+    if relax_level < 4:
+        for nurse in active_nurses:
+            nid = str(nurse["id"])
+            if nid not in data:
+                continue
+            nurse_max = nurse.get("maxNightShifts", max_night)
+            if relax_level == 3:
+                nurse_max += 1
+            cnt = sum(1 for s in data[nid] if s == "夜")
+            if cnt > nurse_max:
+                errors.append(f"Nurse {nid}: 夜勤 {cnt}回 (上限{nurse_max})")
 
     return errors
 
@@ -1436,8 +1651,8 @@ def solve_schedule(request_data: dict) -> list[dict]:
         last_status = None
         attempts: list[dict] = []  # 各 relax_level の試行記録
 
-        # 試行: relax 0(完全遵守) → 1(日勤緩和) → 2(日勤・夜勤緩和)
-        for relax_level in (0, 1, 2):
+        # 試行: relax 0(完全) → 1(日勤緩和) → 2(夜勤緩和) → 3(連続/夜勤回数緩和) → 4(全ソフト)
+        for relax_level in (0, 1, 2, 3, 4):
             t0 = time.time()
             res = _solve_one_pattern(params, forbidden_solutions, relax_level=relax_level)
             elapsed = time.time() - t0
@@ -1468,50 +1683,76 @@ def solve_schedule(request_data: dict) -> list[dict]:
             chosen_errors = errors
 
         if chosen is None:
-            err_msg = f"解が見つかりませんでした (status={last_status})"
-            if diagnostics["warnings"]:
-                err_msg += " — " + "; ".join(diagnostics["warnings"][:2])
-            _log(f"!!! {label} 全 relax_level で失敗: {err_msg}")
+            # 5段階すべて失敗 → 貪欲法フォールバック
+            _log(f"!!! {label} 全 relax_level 失敗 → 貪欲法フォールバック")
+            t_g = time.time()
+            try:
+                greedy_data = _greedy_fallback(params)
+                greedy_errors = _validate(greedy_data, params, relax_level=4)
+                attempts.append({
+                    "relaxLevel": 5,
+                    "status": "GREEDY_FALLBACK",
+                    "elapsedSec": round(time.time() - t_g, 2),
+                    "validationErrors": len(greedy_errors),
+                })
+                chosen = {
+                    "raw": None,
+                    "data": greedy_data,
+                    "objective": 0,
+                    "relax_level": 5,
+                    "fallback_mode": "greedy",
+                    "greedy_errors": greedy_errors,
+                }
+                _log(f"  {label}: 貪欲法で生成 (違反{len(greedy_errors)}件, {time.time()-t_g:.2f}s)")
+            except Exception as e:
+                _log(f"!!! 貪欲法も失敗: {e}")
+                err_msg = f"解が見つかりませんでした (status={last_status}; 貪欲法エラー: {e})"
+                if diagnostics["warnings"]:
+                    err_msg += " — " + "; ".join(diagnostics["warnings"][:2])
 
-            # UNSAT core 解析 (最初のパターンの失敗時のみ実施: 結果は同条件で同じ)
-            unsat_info = None
-            if pat_idx == 0:
-                _log(f"!!! UNSAT core 解析を開始 (assumption-based)")
-                t_unsat = time.time()
-                try:
-                    unsat_info = _diagnose_infeasible(params)
-                    _log(f"!!! UNSAT core: {unsat_info.get('sufficientAssumptions')} ({time.time()-t_unsat:.2f}s)")
-                except Exception as e:
-                    _log(f"!!! UNSAT core 解析失敗: {e}")
-                    unsat_info = {"error": str(e)}
+                # UNSAT core 解析 (最初のパターンのみ)
+                unsat_info = None
+                if pat_idx == 0:
+                    _log(f"!!! UNSAT core 解析を開始 (assumption-based)")
+                    t_unsat = time.time()
+                    try:
+                        unsat_info = _diagnose_infeasible(params)
+                        _log(f"!!! UNSAT core: {unsat_info.get('sufficientAssumptions')} ({time.time()-t_unsat:.2f}s)")
+                    except Exception as e2:
+                        _log(f"!!! UNSAT core 解析失敗: {e2}")
+                        unsat_info = {"error": str(e2)}
 
-            results.append({
-                "label": label,
-                "data": {},
-                "score": 0,
-                "metrics": {
-                    "solverUsed": True,
-                    "error": err_msg,
-                    "solverStatus": last_status,
-                    "validationErrors": chosen_errors[:10],
-                    "attempts": attempts,
-                    "diagnostics": diagnostics,
-                    "unsatCore": unsat_info,
-                    # フロント描画が undefined で落ちないように 0 埋め
-                    "relaxLevel": -1,
-                    "nightBalance": 0,
-                    "dayShortage": 0,
-                    "nightShortage": 0,
-                    "consecViolations": 0,
-                    "requestMatch": 0,
-                    "avgDaysOff": 0,
-                    "nullCells": 0,
-                },
-            })
-            continue
+                results.append({
+                    "label": label,
+                    "data": {},
+                    "score": 0,
+                    "metrics": {
+                        "solverUsed": True,
+                        "error": err_msg,
+                        "solverStatus": last_status,
+                        "validationErrors": chosen_errors[:10],
+                        "attempts": attempts,
+                        "diagnostics": diagnostics,
+                        "unsatCore": unsat_info,
+                        "fallbackMode": "error",
+                        "warningMessage": "ソルバーも貪欲法も結果を生成できませんでした。データ修正が必要です。",
+                        "relaxLevel": -1,
+                        "nightBalance": 0,
+                        "dayShortage": 0,
+                        "nightShortage": 0,
+                        "consecViolations": 0,
+                        "requestMatch": 0,
+                        "avgDaysOff": 0,
+                        "nullCells": 0,
+                    },
+                })
+                continue
 
-        forbidden_solutions.append(chosen["raw"])
+        # raw が None (貪欲法) の場合は禁止解として追加しない
+        if chosen.get("raw") is not None:
+            forbidden_solutions.append(chosen["raw"])
         data = chosen["data"]
+        is_greedy = chosen.get("fallback_mode") == "greedy"
 
         # ── Metrics ──
         night_vals = [sum(1 for s in data[str(n["id"])] if s == "夜") for n in active_nurses]
@@ -1561,6 +1802,23 @@ def solve_schedule(request_data: dict) -> list[dict]:
 
         score = max(0, 10000 - (chosen["objective"] or 0))
 
+        if is_greedy:
+            warning_msg = (
+                f"通常ソルバーで解が見つからなかったため貪欲法で生成しました "
+                f"(違反 {len(chosen.get('greedy_errors', []))} 件)。"
+                f"勤務表は必ず手動で確認・修正してください。"
+            )
+            fallback_mode = "greedy"
+        elif chosen["relax_level"] >= 3:
+            warning_msg = (
+                f"通常制約では解けず、緩和レベル {chosen['relax_level']} で生成しました。"
+                f"連続勤務や夜勤回数の上限を一時的に緩めています。"
+            )
+            fallback_mode = "solver"
+        else:
+            warning_msg = None
+            fallback_mode = "solver"
+
         results.append({
             "label": label,
             "data": data,
@@ -1568,6 +1826,8 @@ def solve_schedule(request_data: dict) -> list[dict]:
             "metrics": {
                 "solverUsed": True,
                 "relaxLevel": chosen["relax_level"],
+                "fallbackMode": fallback_mode,
+                "warningMessage": warning_msg,
                 "nightBalance": round(night_balance, 1),
                 "dayShortage": total_day_shortage,
                 "nightShortage": total_night_shortage,

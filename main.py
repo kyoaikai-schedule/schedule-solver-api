@@ -1,6 +1,8 @@
 import os
+import traceback
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from solver import solve_schedule
 from solver_team import solve_with_teams
 
@@ -28,12 +30,44 @@ def health():
     return {"status": "ok"}
 
 
+def _error_pattern(label: str, exc: Exception) -> dict:
+    """例外時もフロントが描画できるダミーパターンを返す。"""
+    return {
+        "label": label,
+        "data": {},
+        "score": 0,
+        "metrics": {
+            "solverUsed": False,
+            "error": f"サーバーエラー: {exc}",
+            "traceback": traceback.format_exc()[:2000],
+            "fallbackMode": "error",
+            "warningMessage": "サーバー側で予期しないエラーが発生しました。データ修正後に再試行してください。",
+            "relaxLevel": -1,
+            "nightBalance": 0,
+            "dayShortage": 0,
+            "nightShortage": 0,
+            "consecViolations": 0,
+            "requestMatch": 0,
+            "avgDaysOff": 0,
+            "nullCells": 0,
+        },
+    }
+
+
 @app.post("/solve")
 async def solve(request: Request):
     verify_api_key(request)
-    body = await request.json()
-    patterns = solve_schedule(body)
-    return {"patterns": patterns}
+    try:
+        body = await request.json()
+        patterns = solve_schedule(body)
+        return {"patterns": patterns}
+    except HTTPException:
+        raise
+    except Exception as e:
+        return JSONResponse(
+            status_code=200,
+            content={"patterns": [_error_pattern("エラー", e)]},
+        )
 
 
 @app.post("/solve_team")
@@ -41,8 +75,16 @@ async def solve_team(request: Request):
     """フェーズ2: 夜勤チーム編成対応エンドポイント。
     既存 /solve とは独立。team フィールドを各 nurse に持たせて呼び出す。"""
     verify_api_key(request)
-    body = await request.json()
-    return solve_with_teams(body)
+    try:
+        body = await request.json()
+        return solve_with_teams(body)
+    except HTTPException:
+        raise
+    except Exception as e:
+        return JSONResponse(
+            status_code=200,
+            content={"patterns": [_error_pattern("エラー", e)]},
+        )
 
 
 @app.get("/test")

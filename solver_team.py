@@ -27,6 +27,7 @@ from solver import (
     _post_process,
     _validate,
     _preflight_diagnostics,
+    _greedy_fallback,  # 最終フォールバック (チーム制約完全に外す)
     solve_schedule,  # relax_team=2 のフォールバックで使う
 )
 
@@ -1044,33 +1045,56 @@ def solve_with_teams(request_data: dict) -> dict:
             _log(f"  {label} relax_team={relax_team}: validation NG ({len(errors)}件) → 次へ")
 
         if chosen is None:
-            # 全レベル失敗
-            results.append({
-                "label": label,
-                "data": {},
-                "score": 0,
-                "metrics": {
-                    "solverUsed": True,
-                    "error": "解が見つかりませんでした (チームモード全レベル失敗)",
-                    "relaxLevel": -1,
-                    "nightBalance": 0, "dayShortage": 0, "nightShortage": 0,
-                    "consecViolations": 0, "requestMatch": 0, "avgDaysOff": 0, "nullCells": 0,
-                    "teamMetrics": {
-                        "teamMode": True,
-                        "teamCount": len(used_teams),
-                        "usedTeams": used_teams,
-                        "fallbackLevel": -1,
-                        "attemptsTeam": attempts_team,
-                        "perDayTeamBalance": [],
-                        "balanceRate": None,
-                        "balancedDays": 0,
-                        "totalDays": 0,
-                        "diagnostics": team_diag,
+            # チーム3段すべて失敗 → 貪欲法フォールバック (チーム制約完全に無視)
+            _log(f"!!! {label} チームモード全段失敗 → 貪欲法フォールバック")
+            t_g = time.time()
+            try:
+                greedy_data = _greedy_fallback(params)
+                greedy_errors = _validate(greedy_data, params, relax_level=4)
+                attempts_team.append({
+                    "relaxTeam": 3,
+                    "status": "GREEDY_FALLBACK",
+                    "elapsedSec": round(time.time() - t_g, 2),
+                    "validationErrors": len(greedy_errors),
+                })
+                chosen = {
+                    "data_labels": greedy_data,
+                    "score": 0,
+                    "fallback": "greedy",
+                    "greedy_errors": greedy_errors,
+                }
+                chosen_relax_team = 3  # 貪欲法を示す
+                _log(f"  {label}: チーム貪欲法で生成 (違反{len(greedy_errors)}件, {time.time()-t_g:.2f}s)")
+            except Exception as e:
+                _log(f"!!! チーム貪欲法も失敗: {e}")
+                results.append({
+                    "label": label,
+                    "data": {},
+                    "score": 0,
+                    "metrics": {
+                        "solverUsed": True,
+                        "error": f"解が見つかりませんでした (チームモード全段失敗; 貪欲法エラー: {e})",
+                        "fallbackMode": "error",
+                        "warningMessage": "ソルバーも貪欲法も結果を生成できませんでした。データ修正が必要です。",
+                        "relaxLevel": -1,
+                        "nightBalance": 0, "dayShortage": 0, "nightShortage": 0,
+                        "consecViolations": 0, "requestMatch": 0, "avgDaysOff": 0, "nullCells": 0,
+                        "teamMetrics": {
+                            "teamMode": True,
+                            "teamCount": len(used_teams),
+                            "usedTeams": used_teams,
+                            "fallbackLevel": -1,
+                            "attemptsTeam": attempts_team,
+                            "perDayTeamBalance": [],
+                            "balanceRate": None,
+                            "balancedDays": 0,
+                            "totalDays": 0,
+                            "diagnostics": team_diag,
+                        },
+                        "diagnostics": preflight,
                     },
-                    "diagnostics": preflight,
-                },
-            })
-            continue
+                })
+                continue
 
         # チームメトリクス計算
         if "raw" in chosen:
@@ -1102,6 +1126,21 @@ def solve_with_teams(request_data: dict) -> dict:
 
         score = chosen.get("score") or max(0, 10000 - chosen.get("objective", 0))
 
+        is_greedy_team = chosen.get("fallback") == "greedy"
+        if is_greedy_team:
+            fallback_mode = "greedy"
+            warning_msg = (
+                f"チームモードでもソルバー失敗、貪欲法で生成しました "
+                f"(違反 {len(chosen.get('greedy_errors', []))} 件)。"
+                f"勤務表は必ず手動で確認・修正してください。"
+            )
+        elif chosen_relax_team == 2:
+            fallback_mode = "solver"
+            warning_msg = "チーム制約を完全に外して通常ソルバーで生成しました。"
+        else:
+            fallback_mode = "solver"
+            warning_msg = None
+
         results.append({
             "label": label,
             "data": chosen["data_labels"],
@@ -1109,6 +1148,8 @@ def solve_with_teams(request_data: dict) -> dict:
             "metrics": {
                 "solverUsed": True,
                 "relaxLevel": 0,
+                "fallbackMode": fallback_mode,
+                "warningMessage": warning_msg,
                 "nightBalance": round(night_balance, 1),
                 "avgDaysOff": round(avg_off, 1),
                 "teamMetrics": team_metrics,
